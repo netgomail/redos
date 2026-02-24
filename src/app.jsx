@@ -1,32 +1,40 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useReducer, useEffect, useCallback, useTransition } from 'react';
 import { render, Box, Text, useInput, useApp, useStdout } from 'ink';
 import { readdirSync, statSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 
 const VERSION = '0.1.0';
-let _id = 0;
-const uid = () => ++_id;
+let _msgId = 0;
+
+// ─── Messages reducer ─────────────────────────────────────────────────────────
+function messagesReducer(state, action) {
+  switch (action.type) {
+    case 'add':   return [...state, { id: ++_msgId, role: action.role, content: action.content }];
+    case 'clear': return [];
+    default:      return state;
+  }
+}
 
 // ─── Spinner ──────────────────────────────────────────────────────────────────
+const FRAMES = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
+
 function Spinner() {
-  const frames = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
   const [i, setI] = useState(0);
   useEffect(() => {
-    const t = setInterval(() => setI(n => (n + 1) % frames.length), 80);
+    const t = setInterval(() => setI(n => (n + 1) % FRAMES.length), 80);
     return () => clearInterval(t);
   }, []);
-  return <Text color="cyan">{frames[i]}</Text>;
+  return <Text color="cyan">{FRAMES[i]}</Text>;
 }
 
 // ─── Header ───────────────────────────────────────────────────────────────────
 function Header() {
   const { stdout } = useStdout();
-  const width = (stdout?.columns || 80);
+  const width = stdout?.columns ?? 80;
   const cwd = process.cwd();
   const home = homedir();
-  const short = cwd.startsWith(home) ? '~' + cwd.slice(home.length) : cwd;
-  const dir = short.replace(/\\/g, '/');
+  const dir = (cwd.startsWith(home) ? '~' + cwd.slice(home.length) : cwd).replace(/\\/g, '/');
 
   return (
     <Box flexDirection="column" marginBottom={1}>
@@ -40,20 +48,22 @@ function Header() {
   );
 }
 
-// ─── Welcome tips (показываются только при пустой истории) ───────────────────
+// ─── Welcome tips ─────────────────────────────────────────────────────────────
+const TIPS = [
+  ['/help',   'список всех команд'],
+  ['/files',  'файлы в текущей папке'],
+  ['/model',  'информация о модели'],
+  ['/status', 'статус сессии'],
+  ['/exit',   'выход'],
+];
+
 function WelcomeTips() {
   return (
     <Box flexDirection="column" marginBottom={1} paddingLeft={2}>
       <Box marginBottom={1}>
         <Text color="gray">Начните вводить сообщение или используйте команду:</Text>
       </Box>
-      {[
-        ['/help',   'список всех команд'],
-        ['/files',  'файлы в текущей папке'],
-        ['/model',  'информация о модели'],
-        ['/status', 'статус сессии'],
-        ['/exit',   'выход'],
-      ].map(([cmd, desc]) => (
+      {TIPS.map(([cmd, desc]) => (
         <Box key={cmd}>
           <Text color="gray">{'  • '}</Text>
           <Text color="cyan">{cmd}</Text>
@@ -64,7 +74,7 @@ function WelcomeTips() {
   );
 }
 
-// ─── Сообщение пользователя ───────────────────────────────────────────────────
+// ─── Message components ───────────────────────────────────────────────────────
 function UserMessage({ content }) {
   return (
     <Box marginBottom={1} paddingLeft={2}>
@@ -74,32 +84,25 @@ function UserMessage({ content }) {
   );
 }
 
-// ─── Сообщение ассистента ─────────────────────────────────────────────────────
 function AssistantMessage({ content }) {
   return (
-    <Box flexDirection="column" marginBottom={1} paddingLeft={2}>
-      <Box>
-        <Text color="magenta" bold>{'◆  '}</Text>
-        <Text>{content}</Text>
-      </Box>
+    <Box marginBottom={1} paddingLeft={2}>
+      <Text color="magenta" bold>{'◆  '}</Text>
+      <Text>{content}</Text>
     </Box>
   );
 }
 
-// ─── Системное сообщение (вывод команд) ──────────────────────────────────────
 function SystemMessage({ content }) {
   return (
     <Box flexDirection="column" marginBottom={1} paddingLeft={4}>
       {content.split('\n').map((line, i) => (
-        <Box key={i}>
-          <Text color="gray">{line}</Text>
-        </Box>
+        <Text key={i} color="gray">{line}</Text>
       ))}
     </Box>
   );
 }
 
-// ─── Сообщение об ошибке ──────────────────────────────────────────────────────
 function ErrorMessage({ content }) {
   return (
     <Box marginBottom={1} paddingLeft={2}>
@@ -109,7 +112,6 @@ function ErrorMessage({ content }) {
   );
 }
 
-// ─── Индикатор "думаю" ────────────────────────────────────────────────────────
 function Thinking() {
   return (
     <Box marginBottom={1} paddingLeft={2}>
@@ -119,10 +121,10 @@ function Thinking() {
   );
 }
 
-// ─── Поле ввода (внизу, бокс как в Claude Code) ───────────────────────────────
-function InputBox({ value, isThinking, isMultiline }) {
+// ─── Input box ────────────────────────────────────────────────────────────────
+function InputBox({ value, isThinking }) {
   const { stdout } = useStdout();
-  const width = (stdout?.columns || 80);
+  const width = stdout?.columns ?? 80;
 
   return (
     <Box flexDirection="column" marginTop={1}>
@@ -130,11 +132,10 @@ function InputBox({ value, isThinking, isMultiline }) {
         borderStyle="round"
         borderColor={isThinking ? 'gray' : 'cyan'}
         paddingX={1}
-        paddingY={0}
         width={width}
         minHeight={3}
       >
-        <Box flexDirection="column" flexGrow={1}>
+        <Box flexGrow={1}>
           {isThinking ? (
             <Box>
               <Spinner />
@@ -144,7 +145,6 @@ function InputBox({ value, isThinking, isMultiline }) {
             <Box>
               <Text color="cyan" bold>{'> '}</Text>
               <Text color="white">{value}</Text>
-              {/* блок-курсор */}
               <Text backgroundColor="cyan" color="black">{' '}</Text>
             </Box>
           )}
@@ -159,9 +159,11 @@ function InputBox({ value, isThinking, isMultiline }) {
   );
 }
 
-// ─── Команды ──────────────────────────────────────────────────────────────────
-function useCommands(addMsg, clearMsgs, exit) {
+// ─── Commands hook ────────────────────────────────────────────────────────────
+function useCommands(dispatch, exit) {
   return useCallback((cmd, arg) => {
+    const add = (role, content) => dispatch({ type: 'add', role, content });
+
     switch (cmd) {
       case '/exit':
       case '/quit':
@@ -169,11 +171,11 @@ function useCommands(addMsg, clearMsgs, exit) {
         break;
 
       case '/clear':
-        clearMsgs();
+        dispatch({ type: 'clear' });
         break;
 
       case '/help':
-        addMsg('system', [
+        add('system', [
           'Доступные команды:',
           '',
           '  /help            показать этот список',
@@ -189,11 +191,11 @@ function useCommands(addMsg, clearMsgs, exit) {
         break;
 
       case '/version':
-        addMsg('system', 'МойКод v' + VERSION);
+        add('system', 'МойКод v' + VERSION);
         break;
 
       case '/model':
-        addMsg('system', [
+        add('system', [
           'Модель:     mycode-stub-1',
           'Провайдер:  localhost (заглушка)',
           'Контекст:   200 000 токенов',
@@ -204,11 +206,11 @@ function useCommands(addMsg, clearMsgs, exit) {
       case '/status': {
         const up = process.uptime();
         const m = Math.floor(up / 60), s = Math.floor(up % 60);
-        addMsg('system', [
+        add('system', [
           'Статус:         ● активна',
           'Аптайм:         ' + (m > 0 ? m + 'м ' : '') + s + 'с',
           'Рабочая папка:  ' + process.cwd().replace(/\\/g, '/'),
-          'Node.js:        ' + process.version,
+          'Bun:            ' + process.version,
           'ОС:             ' + (process.platform === 'win32' ? 'Windows' : process.platform),
         ].join('\n'));
         break;
@@ -225,29 +227,28 @@ function useCommands(addMsg, clearMsgs, exit) {
               st.isDirectory() ? dirs.push(name) : files.push({ name, size: st.size });
             } catch { files.push({ name, size: 0 }); }
           }
-          const fmt = sz => sz > 1048576
-            ? (sz / 1048576).toFixed(1) + ' МБ'
-            : sz > 1024 ? (sz / 1024).toFixed(1) + ' КБ' : sz + ' Б';
-          addMsg('system', [
-            target.replace(/\\/g, '/'),
-            '',
+          const fmt = sz =>
+            sz > 1048576 ? (sz / 1048576).toFixed(1) + ' МБ' :
+            sz > 1024    ? (sz / 1024).toFixed(1)    + ' КБ' :
+                           sz + ' Б';
+          add('system', [
+            target.replace(/\\/g, '/'), '',
             ...dirs.sort().map(d => '  📁  ' + d + '/'),
             ...files.sort((a, b) => a.name.localeCompare(b.name)).map(f => '  📄  ' + f.name + '  ' + fmt(f.size)),
-            '',
-            '  ' + dirs.length + ' папок, ' + files.length + ' файлов',
+            '', '  ' + dirs.length + ' папок, ' + files.length + ' файлов',
           ].join('\n'));
         } catch {
-          addMsg('error', 'Не удалось открыть: ' + target);
+          add('error', 'Не удалось открыть: ' + target);
         }
         break;
       }
 
       case '/run':
-        addMsg('system', '[заглушка] В реальной версии выполнилась бы: ' + (arg || '(пусто)'));
+        add('system', '[заглушка] В реальной версии выполнилась бы: ' + (arg || '(пусто)'));
         break;
 
       case '/config':
-        addMsg('system', [
+        add('system', [
           'Настройки (заглушка):',
           '  Тема:            dark',
           '  Язык:            ru',
@@ -257,28 +258,31 @@ function useCommands(addMsg, clearMsgs, exit) {
         break;
 
       default:
-        addMsg('error', 'Неизвестная команда: ' + cmd + '  (введите /help)');
+        add('error', 'Неизвестная команда: ' + cmd + '  (введите /help)');
     }
-  }, [addMsg, clearMsgs, exit]);
+  }, [dispatch, exit]);
 }
 
-// ─── Главный компонент ────────────────────────────────────────────────────────
+// ─── Stub AI responses ────────────────────────────────────────────────────────
+const STUB_RESPONSES = [
+  t => 'Понял задачу: "' + t.slice(0, 60) + (t.length > 60 ? '…' : '') + '". Обрабатываю...',
+  () => 'Хороший вопрос! В реальной версии здесь был бы настоящий ответ.',
+  () => 'Анализирую запрос. Это заглушка — AI не подключён.',
+  () => 'Запрос принят. Токенов: ~' + (Math.floor(Math.random() * 200) + 50) + ' [заглушка]',
+];
+
+// ─── App ──────────────────────────────────────────────────────────────────────
 function App() {
   const { exit } = useApp();
   const [input, setInput] = useState('');
-  const [messages, setMessages] = useState([]);
-  const [isThinking, setIsThinking] = useState(false);
+  const [messages, dispatch] = useReducer(messagesReducer, []);
+  const [isPending, startTransition] = useTransition();
 
-  const addMsg = useCallback((role, content) =>
-    setMessages(prev => [...prev, { id: uid(), role, content }]), []);
-
-  const clearMsgs = useCallback(() => setMessages([]), []);
-
-  const handleCommand = useCommands(addMsg, clearMsgs, exit);
+  const handleCommand = useCommands(dispatch, exit);
 
   const handleSubmit = useCallback((text) => {
     const t = text.trim();
-    if (!t || isThinking) return;
+    if (!t || isPending) return;
 
     if (t.startsWith('/')) {
       const sp = t.indexOf(' ');
@@ -288,20 +292,16 @@ function App() {
       return;
     }
 
-    addMsg('user', t);
-    setIsThinking(true);
+    dispatch({ type: 'add', role: 'user', content: t });
 
-    setTimeout(() => {
-      setIsThinking(false);
-      const rs = [
-        'Понял задачу: "' + t.slice(0, 60) + (t.length > 60 ? '…' : '') + '". Обрабатываю...',
-        'Хороший вопрос! В реальной версии здесь был бы настоящий ответ.',
-        'Анализирую запрос. Это заглушка — AI не подключён.',
-        'Запрос принят. Токенов: ~' + (Math.floor(Math.random() * 200) + 50) + ' [заглушка]',
-      ];
-      addMsg('assistant', rs[Math.floor(Math.random() * rs.length)]);
-    }, 1200 + Math.random() * 800);
-  }, [isThinking, addMsg, handleCommand]);
+    // React 19: startTransition accepts async functions
+    // isPending stays true until the async function resolves
+    startTransition(async () => {
+      await new Promise(r => setTimeout(r, 1200 + Math.random() * 800));
+      const fn = STUB_RESPONSES[Math.floor(Math.random() * STUB_RESPONSES.length)];
+      dispatch({ type: 'add', role: 'assistant', content: fn(t) });
+    });
+  }, [isPending, dispatch, handleCommand]);
 
   useInput((char, key) => {
     if (key.ctrl && char === 'c') { exit(); return; }
@@ -322,8 +322,8 @@ function App() {
         if (msg.role === 'error')     return <ErrorMessage     key={msg.id} content={msg.content} />;
         return                               <SystemMessage    key={msg.id} content={msg.content} />;
       })}
-      {isThinking && <Thinking />}
-      <InputBox value={input} isThinking={isThinking} />
+      {isPending && <Thinking />}
+      <InputBox value={input} isThinking={isPending} />
     </Box>
   );
 }
