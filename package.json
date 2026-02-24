@@ -1,0 +1,27 @@
+{
+  "name": "mycode",
+  "version": "0.1.0",
+  "description": "AI-ассистент для разработки (учебный проект)",
+  "main": "src/app.jsx",
+  "scripts": {
+    "start":       "bun src/app.jsx",
+    "build:win":   "bun run bunbuild.mjs",
+    "build:linux": "bun run bunbuild.mjs --linux",
+    "build:mac":   "bun run bunbuild.mjs --mac",
+    "build:all":   "bun run bunbuild.mjs --all"
+  },
+  "pkg": {
+    "assets": ["dist/yoga.wasm"],
+    "targets": ["node22-win-x64", "node22-linux-x64", "node22-macos-x64"]
+  },
+  "dependencies": {
+    "ink": "^4.4.1",
+    "react": "^18.3.1"
+  },
+  "devDependencies": {
+    "@yao-pkg/pkg": "^5.12.0",
+    "esbuild": "^0.27.3"
+  },
+  "keywords": ["cli", "ai", "assistant"],
+  "license": "MIT"
+}

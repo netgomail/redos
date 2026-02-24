@@ -1,0 +1,23 @@
+# Зависимости
+node_modules/
+bun.lockb
+
+# Скомпилированные бинарники (публикуются через GitHub Releases, не в репо)
+dist/
+
+# Кэш сборки
+.cache/
+*.tgz
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Логи
+*.log
+npm-debug.log*
