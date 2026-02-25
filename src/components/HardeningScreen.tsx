@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Box, Text, useInput, useStdout } from 'ink';
 import { buildChecks, statusIcon, statusColor } from '../features/hardening';
-import type { CheckItem, CheckStatus } from '../features/hardening';
+import type { CheckItem, CheckStatus, FixResult } from '../features/hardening';
 
 interface Props {
   onExit: () => void;
@@ -16,6 +16,7 @@ export function HardeningScreen({ onExit }: Props) {
   const [selected, setSelected] = useState(0);
   const [exported, setExported] = useState<string | null>(null);
   const [running, setRunning] = useState(true);
+  const [fixMessages, setFixMessages] = useState<Map<string, FixResult>>(new Map());
 
   // Запускаем все проверки при монтировании
   useEffect(() => {
@@ -33,6 +34,23 @@ export function HardeningScreen({ onExit }: Props) {
     if (key.downArrow) setSelected(i => Math.min(checks.length - 1, i + 1));
 
     if (char === 'q' || key.escape) { onExit(); return; }
+
+    if (char === 'f' || char === 'F') {
+      const item = checks[selected];
+      if (!item?.fix) return;
+      const status = results.get(item.id) ?? 'unknown';
+      if (status === 'pass') return;
+
+      const result = item.fix();
+
+      // Перепроверяем статус после фикса
+      let newStatus: CheckStatus;
+      try { newStatus = item.check(); } catch { newStatus = 'unknown'; }
+
+      setResults(prev => new Map(prev).set(item.id, newStatus));
+      setFixMessages(prev => new Map(prev).set(item.id, result));
+      return;
+    }
 
     if (char === 'e') {
       const date = new Date().toISOString().slice(0, 10);
@@ -74,8 +92,9 @@ export function HardeningScreen({ onExit }: Props) {
   // Группировка по категориям
   const categories = [...new Set(checks.map(c => c.category))];
 
-  const selectedItem = checks[selected];
+  const selectedItem   = checks[selected];
   const selectedStatus = selectedItem ? (results.get(selectedItem.id) ?? 'unknown') : 'unknown';
+  const canFix         = !running && selectedItem?.fix !== undefined && selectedStatus !== 'pass';
 
   return (
     <Box flexDirection="column" width={width}>
@@ -100,7 +119,7 @@ export function HardeningScreen({ onExit }: Props) {
           <Box paddingLeft={2}>
             <Text color="cyan" bold>{`── ${cat} ──`}</Text>
           </Box>
-          {checks.filter(c => c.category === cat).map((item, _i) => {
+          {checks.filter(c => c.category === cat).map((item) => {
             const globalIdx = checks.indexOf(item);
             const isSelected = globalIdx === selected;
             const status = results.get(item.id) ?? 'unknown';
@@ -121,11 +140,26 @@ export function HardeningScreen({ onExit }: Props) {
         </Box>
       ))}
 
-      {/* Подсказка для выбранного пункта */}
-      {!running && selectedStatus !== 'pass' && (
-        <Box paddingLeft={4} marginBottom={1}>
-          <Text color="yellow">{'↳ '}</Text>
-          <Text color="yellow">{selectedItem?.hint}</Text>
+      {/* Подсказка + результат фикса для выбранного пункта */}
+      {!running && selectedItem && (
+        <Box flexDirection="column" marginBottom={1}>
+          {selectedStatus !== 'pass' && (
+            <Box paddingLeft={4}>
+              <Text color="yellow">{'↳ '}</Text>
+              <Text color="yellow">{selectedItem.hint}</Text>
+            </Box>
+          )}
+          {fixMessages.has(selectedItem.id) && (
+            fixMessages.get(selectedItem.id)!.msg.split('\n').map((line, i) => (
+              <Box key={i} paddingLeft={4}>
+                <Text color={fixMessages.get(selectedItem.id)!.ok ? 'green' : 'red'}>
+                  {i === 0
+                    ? (fixMessages.get(selectedItem.id)!.ok ? '✓ ' : '✗ ') + line
+                    : '  ' + line}
+                </Text>
+              </Box>
+            ))
+          )}
         </Box>
       )}
 
@@ -139,7 +173,7 @@ export function HardeningScreen({ onExit }: Props) {
       {/* Подвал */}
       <Box paddingLeft={2}>
         <Text color="gray" dimColor>
-          {'↑↓ навигация  ·  E экспорт отчёта  ·  Q/Esc выход'}
+          {'↑↓ навигация  ·  E экспорт' + (canFix ? '  ·  F исправить' : '') + '  ·  Q/Esc выход'}
         </Text>
       </Box>
     </Box>
