@@ -244,16 +244,29 @@ function sectionMountOptions(): AuditSection {
 
 // ─── public API ───────────────────────────────────────────────────────────────
 
-export function runAudit(): AuditSection[] {
-  return [
-    sectionUsers(),
-    sectionPasswords(),
-    sectionWheel(),
-    sectionSuid(),
-    sectionWorldWritable(),
-    sectionOrphanFiles(),
-    sectionMountOptions(),
-  ];
+const AUDIT_STEPS: { label: string; fn: () => AuditSection }[] = [
+  { label: 'Пользователи',          fn: sectionUsers },
+  { label: 'Пароли',                fn: sectionPasswords },
+  { label: 'Привилегии (wheel)',    fn: sectionWheel },
+  { label: 'SUID/SGID файлы',      fn: sectionSuid },
+  { label: 'World-writable',       fn: sectionWorldWritable },
+  { label: 'Файлы без владельца',  fn: sectionOrphanFiles },
+  { label: 'Опции монтирования',   fn: sectionMountOptions },
+];
+
+/** Запускает аудит посекционно, вызывая onProgress перед каждым шагом */
+export async function runAudit(
+  onProgress?: (step: number, total: number, label: string) => void,
+): Promise<AuditSection[]> {
+  const sections: AuditSection[] = [];
+  for (let i = 0; i < AUDIT_STEPS.length; i++) {
+    const { label, fn } = AUDIT_STEPS[i];
+    onProgress?.(i + 1, AUDIT_STEPS.length, label);
+    // Даём React отрендерить прогресс
+    await new Promise(r => setTimeout(r, 0));
+    sections.push(fn());
+  }
+  return sections;
 }
 
 export function formatAudit(sections: AuditSection[]): string {

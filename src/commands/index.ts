@@ -39,14 +39,22 @@ function linuxOnly(add: AddFn, label: string): boolean {
   return true;
 }
 
-async function runAndOutput(
+type Section = { title: string; lines: string[] };
+type ProgressFn = (step: number, total: number, label: string) => void;
+type RunFn = (onProgress?: ProgressFn) => Promise<Section[]>;
+type FormatFn = (sections: Section[]) => string;
+
+async function runWithProgress(
   add: AddFn,
   arg: string,
-  run: () => { title: string; lines: string[] }[],
-  format: (sections: { title: string; lines: string[] }[]) => string,
-  defaultFile: string,
+  startMsg: string,
+  run: RunFn,
+  format: FormatFn,
 ) {
-  const sections = run();
+  add('system', startMsg);
+  const sections = await run((step, total, label) => {
+    add('system', `  [${step}/${total}] ${label}...`);
+  });
   const text = format(sections);
   if (arg) {
     const filename = arg.trim();
@@ -105,20 +113,17 @@ async function handleInventory(add: AddFn, arg: string) {
 
 async function handleAudit(add: AddFn, arg: string) {
   if (!linuxOnly(add, 'Аудит безопасности')) return;
-  add('system', 'Запускаю аудит безопасности...');
-  await runAndOutput(add, arg, runAudit, formatAudit, 'audit-report');
+  await runWithProgress(add, arg, 'Аудит безопасности...', runAudit, formatAudit);
 }
 
 async function handleFirewall(add: AddFn, arg: string) {
   if (!linuxOnly(add, 'Анализ фаервола')) return;
-  add('system', 'Анализирую фаервол...');
-  await runAndOutput(add, arg, runFirewallAnalysis, formatFirewall, 'firewall-report');
+  await runWithProgress(add, arg, 'Анализ фаервола...', runFirewallAnalysis, formatFirewall);
 }
 
 async function handleLogs(add: AddFn, arg: string) {
   if (!linuxOnly(add, 'Анализ логов')) return;
-  add('system', 'Анализирую логи безопасности...');
-  await runAndOutput(add, arg, runLogAnalysis, formatLogs, 'security-logs');
+  await runWithProgress(add, arg, 'Анализ логов безопасности...', runLogAnalysis, formatLogs);
 }
 
 // ─── hook ────────────────────────────────────────────────────────────────────

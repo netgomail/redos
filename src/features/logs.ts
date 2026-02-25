@@ -182,16 +182,27 @@ function sectionSummary(): LogSection {
 
 // ─── public API ───────────────────────────────────────────────────────────────
 
-export function runLogAnalysis(): LogSection[] {
-  return [
-    sectionSummary(),
-    sectionFailedSSH(),
-    sectionAcceptedSSH(),
-    sectionSudo(),
-    sectionLockedAccounts(),
-    sectionCriticalEvents(),
-    sectionSelinuxDenials(),
-  ];
+const LOG_STEPS: { label: string; fn: () => LogSection }[] = [
+  { label: 'Сводка',                fn: sectionSummary },
+  { label: 'Неудачные SSH-входы',   fn: sectionFailedSSH },
+  { label: 'Успешные SSH-входы',    fn: sectionAcceptedSSH },
+  { label: 'Операции sudo',         fn: sectionSudo },
+  { label: 'Блокировки',           fn: sectionLockedAccounts },
+  { label: 'Критические события',  fn: sectionCriticalEvents },
+  { label: 'SELinux denials',       fn: sectionSelinuxDenials },
+];
+
+export async function runLogAnalysis(
+  onProgress?: (step: number, total: number, label: string) => void,
+): Promise<LogSection[]> {
+  const sections: LogSection[] = [];
+  for (let i = 0; i < LOG_STEPS.length; i++) {
+    const { label, fn } = LOG_STEPS[i];
+    onProgress?.(i + 1, LOG_STEPS.length, label);
+    await new Promise(r => setTimeout(r, 0));
+    sections.push(fn());
+  }
+  return sections;
 }
 
 export function formatLogs(sections: LogSection[]): string {

@@ -152,15 +152,26 @@ function sectionSelinux(): FirewallSection {
 
 // ─── public API ───────────────────────────────────────────────────────────────
 
-export function runFirewallAnalysis(): FirewallSection[] {
-  return [
-    sectionFirewalldStatus(),
-    sectionZones(),
-    sectionRichRules(),
-    sectionPorts(),
-    sectionIptables(),
-    sectionSelinux(),
-  ];
+const FW_STEPS: { label: string; fn: () => FirewallSection }[] = [
+  { label: 'Статус firewalld',  fn: sectionFirewalldStatus },
+  { label: 'Зоны',             fn: sectionZones },
+  { label: 'Rich rules',       fn: sectionRichRules },
+  { label: 'Открытые порты',   fn: sectionPorts },
+  { label: 'iptables',         fn: sectionIptables },
+  { label: 'SELinux',          fn: sectionSelinux },
+];
+
+export async function runFirewallAnalysis(
+  onProgress?: (step: number, total: number, label: string) => void,
+): Promise<FirewallSection[]> {
+  const sections: FirewallSection[] = [];
+  for (let i = 0; i < FW_STEPS.length; i++) {
+    const { label, fn } = FW_STEPS[i];
+    onProgress?.(i + 1, FW_STEPS.length, label);
+    await new Promise(r => setTimeout(r, 0));
+    sections.push(fn());
+  }
+  return sections;
 }
 
 export function formatFirewall(sections: FirewallSection[]): string {
