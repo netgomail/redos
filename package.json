@@ -1,16 +1,18 @@
 {
   "name": "mycode",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "main": "src/app.tsx",
   "dependencies": {
     "ink": "6.8.0",
     "react": "19.2.0"
   },
-  "description": "AI-ассистент для разработки (учебный проект)",
+  "description": "Консольная утилита для аудита безопасности Linux",
   "keywords": [
     "cli",
-    "ai",
-    "assistant"
+    "security",
+    "audit",
+    "hardening",
+    "linux"
   ],
   "license": "MIT",
   "pkg": {

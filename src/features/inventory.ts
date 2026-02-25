@@ -1,5 +1,6 @@
-import { readFileSync, existsSync } from 'fs';
+import { existsSync } from 'fs';
 import { cpus, totalmem, freemem, networkInterfaces, hostname } from 'os';
+import { readFile } from '../utils/fs';
 
 export interface InventorySection {
   title: string;
@@ -10,10 +11,6 @@ const isLinux = process.platform === 'linux';
 const isWindows = process.platform === 'win32';
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
-
-function readFile(path: string): string | null {
-  try { return readFileSync(path, 'utf-8'); } catch { return null; }
-}
 
 function spawn(args: string[]): string {
   try {
@@ -39,6 +36,20 @@ function fmtBytes(n: number): string {
   if (n >= 1048576)    return (n / 1048576).toFixed(1)    + ' МБ';
   return n + ' Б';
 }
+
+const MAX_OUTPUT_LINES = 25;
+
+const PS_COMMANDS = {
+  disks:
+    'Get-PSDrive -PSProvider FileSystem | ' +
+    'Where-Object { $_.Used -ne $null } | ' +
+    'ForEach-Object { $total = $_.Used + $_.Free; "{0}:  всего {1}  свободно {2}  ({3}%)" -f ' +
+    '$_.Name, [math]::Round($total/1GB,1).ToString()+"ГБ", [math]::Round($_.Free/1GB,1).ToString()+"ГБ", ' +
+    '[math]::Round(($_.Used/$total)*100) }',
+  users:
+    'Get-LocalUser | Select-Object Name, Enabled, LastLogon | ' +
+    'ForEach-Object { "{0,-24} enabled={1,-5} lastLogon={2}" -f $_.Name, $_.Enabled, $_.LastLogon }',
+} as const;
 
 // ─── sections ─────────────────────────────────────────────────────────────────
 
@@ -92,13 +103,7 @@ function sectionDisks(): InventorySection {
     const out = spawn(['df', '-h', '--output=target,size,used,avail,pcent']);
     if (out) lines = out.split('\n').filter(l => l.trim());
   } else if (isWindows) {
-    const out = spawnPS(
-      'Get-PSDrive -PSProvider FileSystem | ' +
-      'Where-Object { $_.Used -ne $null } | ' +
-      'ForEach-Object { $total = $_.Used + $_.Free; "{0}:  всего {1}  свободно {2}  ({3}%)" -f ' +
-      '$_.Name, [math]::Round($total/1GB,1).ToString()+"ГБ", [math]::Round($_.Free/1GB,1).ToString()+"ГБ", ' +
-      '[math]::Round(($_.Used/$total)*100) }',
-    );
+    const out = spawnPS(PS_COMMANDS.disks);
     if (out) lines.push(...out.split('\n').filter(l => l.trim()));
   }
 
@@ -120,10 +125,7 @@ function sectionUsers(): InventorySection {
       lines.push(...users.length ? users : ['Нет пользователей с UID ≥ 1000']);
     }
   } else if (isWindows) {
-    const out = spawnPS(
-      'Get-LocalUser | Select-Object Name, Enabled, LastLogon | ' +
-      'ForEach-Object { "{0,-24} enabled={1,-5} lastLogon={2}" -f $_.Name, $_.Enabled, $_.LastLogon }',
-    );
+    const out = spawnPS(PS_COMMANDS.users);
     if (out) lines.push(...out.split('\n').filter(l => l.trim()));
   }
 
@@ -153,14 +155,14 @@ function sectionPorts(): InventorySection {
   if (isLinux) {
     const out = spawn(['ss', '-tlnp']);
     if (out) {
-      lines.push(...out.split('\n').filter(l => l.trim()).slice(0, 25));
+      lines.push(...out.split('\n').filter(l => l.trim()).slice(0, MAX_OUTPUT_LINES));
     }
   } else if (isWindows) {
     const out = spawn(['netstat', '-ano', '-p', 'TCP']);
     if (out) {
       const listening = out.split('\n')
         .filter(l => l.includes('LISTENING'))
-        .slice(0, 20);
+        .slice(0, MAX_OUTPUT_LINES);
       lines.push(...listening.length ? listening : ['Нет прослушиваемых портов']);
     }
   }
@@ -182,7 +184,7 @@ function sectionServices(): InventorySection {
   const lines = out.split('\n')
     .filter(l => l.trim())
     .map(l => l.replace(/\s+/g, ' ').trim())
-    .slice(0, 30);
+    .slice(0, MAX_OUTPUT_LINES);
 
   return { title: `Активные сервисы (${lines.length})`, lines };
 }

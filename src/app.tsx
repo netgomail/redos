@@ -1,12 +1,13 @@
-import React, { useState, useTransition, useCallback } from 'react';
+import React, { useState, useCallback } from 'react';
 import { render, Box, useInput, useApp } from 'ink';
 import { Header }          from './components/Header';
 import { WelcomeTips }     from './components/WelcomeTips';
 import { InputBox }        from './components/InputBox';
 import { HardeningScreen } from './components/HardeningScreen';
+import { BaselineScreen } from './components/BaselineScreen';
 import {
-  UserMessage, AssistantMessage,
-  SystemMessage, ErrorMessage, Thinking,
+  UserMessage,
+  SystemMessage, ErrorMessage,
 } from './components/Messages';
 import { useMessages }    from './hooks/useMessages';
 import { useInputState }  from './hooks/useInputState';
@@ -14,19 +15,10 @@ import { useCommands }    from './commands/index';
 import { selfUpdate }     from './utils/update';
 import type { Screen } from './types';
 
-// ─── Stub AI responses ───────────────────────────────────────────────────────
-const STUB_RESPONSES: Array<(t: string) => string> = [
-  t => 'Понял задачу: "' + t.slice(0, 60) + (t.length > 60 ? '…' : '') + '". Обрабатываю...',
-  () => 'Хороший вопрос! В реальной версии здесь был бы настоящий ответ.',
-  () => 'Анализирую запрос. Это заглушка — AI не подключён.',
-  () => 'Запрос принят. Токенов: ~' + (Math.floor(Math.random() * 200) + 50) + ' [заглушка]',
-];
-
 // ─── App ─────────────────────────────────────────────────────────────────────
 function App() {
   const { exit } = useApp();
   const { messages, add, clear } = useMessages();
-  const [isPending, startTransition] = useTransition();
   const [screen, setScreen] = useState<Screen>('chat');
 
   const {
@@ -42,7 +34,7 @@ function App() {
 
   const handleSubmit = useCallback((text: string) => {
     const t = text.trim();
-    if (!t || isPending) return;
+    if (!t) return;
 
     pushHistory(t);
 
@@ -55,13 +47,8 @@ function App() {
       return;
     }
 
-    add('user', t);
-    startTransition(async () => {
-      await new Promise(r => setTimeout(r, 1200 + Math.random() * 800));
-      const fn = STUB_RESPONSES[Math.floor(Math.random() * STUB_RESPONSES.length)];
-      add('assistant', fn(t));
-    });
-  }, [isPending, add, handleCommand, pushHistory]);
+    add('error', 'Введите команду. /help — список команд');
+  }, [add, handleCommand, pushHistory]);
 
   useInput((char, key) => {
     if (key.ctrl && char === 'c') { exit(); return; }
@@ -139,9 +126,12 @@ function App() {
     }
   });
 
-  // ── Экран харденинга ───────────────────────────────────────────────────────
+  // ── Полноэкранные режимы ─────────────────────────────────────────────────
   if (screen === 'hardening') {
     return <HardeningScreen onExit={() => setScreen('chat')} />;
+  }
+  if (screen === 'baseline') {
+    return <BaselineScreen onExit={() => setScreen('chat')} />;
   }
 
   // ── Основной чат-интерфейс ─────────────────────────────────────────────────
@@ -150,15 +140,12 @@ function App() {
       <Header />
       {messages.length === 0 && <WelcomeTips />}
       {messages.map(msg => {
-        if (msg.role === 'user')      return <UserMessage      key={msg.id} content={msg.content} />;
-        if (msg.role === 'assistant') return <AssistantMessage key={msg.id} content={msg.content} />;
-        if (msg.role === 'error')     return <ErrorMessage     key={msg.id} content={msg.content} />;
-        return                               <SystemMessage    key={msg.id} content={msg.content} />;
+        if (msg.role === 'user')  return <UserMessage  key={msg.id} content={msg.content} />;
+        if (msg.role === 'error') return <ErrorMessage key={msg.id} content={msg.content} />;
+        return                           <SystemMessage key={msg.id} content={msg.content} />;
       })}
-      {isPending && <Thinking />}
       <InputBox
         value={input}
-        isThinking={isPending}
         suggestions={suggestions}
         sugIdx={sugIdx}
       />

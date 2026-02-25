@@ -1,15 +1,8 @@
 import React from 'react';
 import { Box, Text } from 'ink';
+import { COMMANDS } from '../commands/index';
 
-const TIPS: [string, string][] = [
-  ['/help',       'список всех команд'],
-  ['/files',      'файлы в текущей папке'],
-  ['/status',     'статус сессии'],
-  ['/hardening',  'чеклист харденинга Linux'],
-  ['/inventory',  'инвентаризация системы'],
-  ['/pass',       'генератор паролей'],
-  ['/exit',       'выход'],
-];
+const TIPS = COMMANDS.filter(c => c.showInTips);
 
 export function WelcomeTips() {
   return (
@@ -17,11 +10,11 @@ export function WelcomeTips() {
       <Box marginBottom={1}>
         <Text color="gray">Начните вводить сообщение или используйте команду:</Text>
       </Box>
-      {TIPS.map(([cmd, desc]) => (
-        <Box key={cmd}>
+      {TIPS.map(cmd => (
+        <Box key={cmd.name}>
           <Text color="gray">{'  • '}</Text>
-          <Text color="cyan">{cmd}</Text>
-          <Text color="gray">{'  ' + desc}</Text>
+          <Text color="cyan">{cmd.name}</Text>
+          <Text color="gray">{'  ' + cmd.description}</Text>
         </Box>
       ))}
     </Box>

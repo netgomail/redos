@@ -1,24 +1,23 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { Box, Text, useInput, useStdout } from 'ink';
-import { buildChecks, statusIcon, statusColor } from '../features/hardening';
-import type { CheckItem, CheckStatus, FixResult } from '../features/hardening';
+import { buildBaselineChecks, statusIcon, statusColor } from '../features/baseline';
+import type { BaselineItem, CheckStatus, FixResult } from '../features/baseline';
 
 interface Props {
   onExit: () => void;
 }
 
-export function HardeningScreen({ onExit }: Props) {
+export function BaselineScreen({ onExit }: Props) {
   const { stdout } = useStdout();
   const width = stdout?.columns ?? 80;
 
-  const [checks] = useState<CheckItem[]>(() => buildChecks());
+  const [checks] = useState<BaselineItem[]>(() => buildBaselineChecks());
   const [results, setResults] = useState<Map<string, CheckStatus>>(new Map());
   const [selected, setSelected] = useState(0);
   const [exported, setExported] = useState<string | null>(null);
   const [running, setRunning] = useState(true);
   const [fixMessages, setFixMessages] = useState<Map<string, FixResult>>(new Map());
 
-  // Запускаем все проверки при монтировании
   useEffect(() => {
     const map = new Map<string, CheckStatus>();
     for (const item of checks) {
@@ -28,6 +27,20 @@ export function HardeningScreen({ onExit }: Props) {
     setResults(map);
     setRunning(false);
   }, [checks]);
+
+  const categories = useMemo(
+    () => [...new Set(checks.map(c => c.category))],
+    [checks],
+  );
+
+  const stats = useMemo(() => {
+    const values = [...results.values()];
+    return {
+      pass: values.filter(s => s === 'pass').length,
+      fail: values.filter(s => s === 'fail').length,
+      warn: values.filter(s => s === 'warn').length,
+    };
+  }, [results]);
 
   useInput((char, key) => {
     if (key.upArrow)   setSelected(i => Math.max(0, i - 1));
@@ -42,8 +55,6 @@ export function HardeningScreen({ onExit }: Props) {
       if (status === 'pass') return;
 
       const result = item.fix();
-
-      // Перепроверяем статус после фикса
       let newStatus: CheckStatus;
       try { newStatus = item.check(); } catch { newStatus = 'unknown'; }
 
@@ -54,9 +65,9 @@ export function HardeningScreen({ onExit }: Props) {
 
     if (char === 'e') {
       const date = new Date().toISOString().slice(0, 10);
-      const filename = `hardening-report-${date}.txt`;
+      const filename = `baseline-report-${date}.txt`;
       const lines: string[] = [
-        '=== Отчёт харденинга Linux ===',
+        '=== CIS Baseline — РедОС / RHEL ===',
         `Дата: ${new Date().toLocaleString('ru-RU')}`,
         `Хост: ${process.env.HOSTNAME ?? 'неизвестно'}`,
         '',
@@ -81,42 +92,26 @@ export function HardeningScreen({ onExit }: Props) {
     }
   });
 
-  const categories = useMemo(
-    () => [...new Set(checks.map(c => c.category))],
-    [checks],
-  );
-
-  const stats = useMemo(() => {
-    const values = [...results.values()];
-    return {
-      pass: values.filter(s => s === 'pass').length,
-      fail: values.filter(s => s === 'fail').length,
-      warn: values.filter(s => s === 'warn').length,
-    };
-  }, [results]);
-
   const selectedItem   = checks[selected];
   const selectedStatus = selectedItem ? (results.get(selectedItem.id) ?? 'unknown') : 'unknown';
   const canFix         = !running && selectedItem?.fix !== undefined && selectedStatus !== 'pass';
 
   return (
     <Box flexDirection="column" width={width}>
-      {/* Заголовок */}
       <Box borderStyle="round" borderColor="cyan" paddingX={1} marginBottom={1} width={width}>
         <Text color="cyan" bold>◆  </Text>
-        <Text bold>Чеклист харденинга Linux  </Text>
+        <Text bold>CIS Baseline — РедОС / RHEL  </Text>
         {running
           ? <Text color="gray">Проверяю...</Text>
           : <Text color="gray">
               <Text color="green">{`✓ ${stats.pass}`}</Text>
               <Text color="gray">  </Text>
               <Text color="red">{`✗ ${stats.fail}`}</Text>
-              <Text color="gray">{`  из ${checks.length}`}</Text>
+              <Text color="gray">{`  ⚠ ${stats.warn}  из ${checks.length}`}</Text>
             </Text>
         }
       </Box>
 
-      {/* Список проверок */}
       {categories.map(cat => (
         <Box key={cat} flexDirection="column" marginBottom={1}>
           <Box paddingLeft={2}>
@@ -143,7 +138,6 @@ export function HardeningScreen({ onExit }: Props) {
         </Box>
       ))}
 
-      {/* Подсказка + результат фикса для выбранного пункта */}
       {!running && selectedItem && (
         <Box flexDirection="column" marginBottom={1}>
           {selectedStatus !== 'pass' && (
@@ -166,14 +160,12 @@ export function HardeningScreen({ onExit }: Props) {
         </Box>
       )}
 
-      {/* Сообщение об экспорте */}
       {exported && (
         <Box paddingLeft={2} marginBottom={1}>
           <Text color="green">{`✓ Отчёт сохранён: ${exported}`}</Text>
         </Box>
       )}
 
-      {/* Подвал */}
       <Box paddingLeft={2}>
         <Text color="gray" dimColor>
           {'↑↓ навигация  ·  E экспорт' + (canFix ? '  ·  F исправить' : '') + '  ·  Q/Esc выход'}

@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { COMMANDS } from '../commands/index';
+import { COMMAND_NAMES } from '../commands/index';
 
 export function useInputState() {
   const [input, setInput]           = useState('');
@@ -12,7 +12,7 @@ export function useInputState() {
   useEffect(() => {
     if (input.startsWith('/') && !input.includes(' ')) {
       const q = input.toLowerCase();
-      const filtered = COMMANDS.filter(c => c.startsWith(q) && c !== q);
+      const filtered = COMMAND_NAMES.filter(c => c.startsWith(q) && c !== q);
       setSuggestions(filtered);
       setSugIdx(0);
     } else {

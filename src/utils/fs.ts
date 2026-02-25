@@ -1,0 +1,5 @@
+import { readFileSync } from 'fs';
+
+export function readFile(path: string): string | null {
+  try { return readFileSync(path, 'utf-8'); } catch { return null; }
+}

@@ -1,5 +1,7 @@
-import { readFileSync, existsSync, readdirSync } from 'fs';
+import { existsSync, readdirSync } from 'fs';
 import { join } from 'path';
+import { readFile } from '../utils/fs';
+import type { TextColor } from '../types';
 
 export type CheckStatus = 'pass' | 'fail' | 'warn' | 'unknown';
 export type FixResult   = { ok: boolean; msg: string };
@@ -14,10 +16,6 @@ export interface CheckItem {
 }
 
 // ─── helpers (check) ──────────────────────────────────────────────────────────
-
-function readFile(path: string): string | null {
-  try { return readFileSync(path, 'utf-8'); } catch { return null; }
-}
 
 /** Найти значение директивы в конфиге вида "Key Value" (ignoreCase) */
 function sshConfigValue(content: string, key: string): string | null {
@@ -171,9 +169,9 @@ function checkPamPwquality(): CheckStatus {
   return /pam_pwquality|pam_cracklib/.test(common) ? 'pass' : 'fail';
 }
 
-function checkFirewallUfw(): CheckStatus {
-  if (!spawnCheck(['which', 'ufw'])) return 'unknown';
-  return spawnCheck(['systemctl', 'is-active', '--quiet', 'ufw']) ? 'pass' : 'fail';
+function checkFirewalld(): CheckStatus {
+  if (!spawnCheck(['which', 'firewall-cmd'])) return 'unknown';
+  return spawnCheck(['systemctl', 'is-active', '--quiet', 'firewalld']) ? 'pass' : 'fail';
 }
 
 function checkAuditd(): CheckStatus {
@@ -263,12 +261,12 @@ export function buildChecks(): CheckItem[] {
       // Нет автофикса — изменение PAM без проверки может заблокировать вход
     },
     {
-      id: 'firewall-ufw',
+      id: 'firewall',
       category: 'Firewall',
-      title: 'ufw активен',
-      hint: 'Запустите: sudo ufw enable',
-      check: checkFirewallUfw,
-      fix: () => sudoRun(['ufw', '--force', 'enable']),
+      title: 'firewalld активен',
+      hint: 'Запустите: sudo systemctl enable --now firewalld',
+      check: checkFirewalld,
+      fix: () => sudoRun(['systemctl', 'enable', '--now', 'firewalld']),
     },
     {
       id: 'auditd',
@@ -317,7 +315,7 @@ export function statusIcon(s: CheckStatus): string {
   }
 }
 
-export function statusColor(s: CheckStatus): string {
+export function statusColor(s: CheckStatus): TextColor {
   switch (s) {
     case 'pass':    return 'green';
     case 'fail':    return 'red';

@@ -7,7 +7,7 @@ interface Props {
   typed: string;
 }
 
-export function Suggestions({ items, selectedIdx, typed }: Props) {
+export const Suggestions = React.memo(function Suggestions({ items, selectedIdx, typed }: Props) {
   if (items.length === 0) return null;
   return (
     <Box flexDirection="column" paddingLeft={3} marginBottom={0}>
@@ -24,4 +24,4 @@ export function Suggestions({ items, selectedIdx, typed }: Props) {
       })}
     </Box>
   );
-}
+});
