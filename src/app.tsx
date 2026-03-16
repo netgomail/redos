@@ -5,6 +5,7 @@ import { WelcomeTips }     from './components/WelcomeTips';
 import { InputBox }        from './components/InputBox';
 import { HardeningScreen } from './components/HardeningScreen';
 import { BaselineScreen } from './components/BaselineScreen';
+import { InstallScreen } from './components/InstallScreen';
 import {
   UserMessage,
   SystemMessage, ErrorMessage,
@@ -132,6 +133,9 @@ function App() {
   }
   if (screen === 'baseline') {
     return <BaselineScreen onExit={() => setScreen('chat')} />;
+  }
+  if (screen === 'install') {
+    return <InstallScreen onExit={() => setScreen('chat')} />;
   }
 
   // ── Основной чат-интерфейс ─────────────────────────────────────────────────

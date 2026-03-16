@@ -8,6 +8,6 @@ export interface Message {
   content: string;
 }
 
-export type Screen = 'chat' | 'hardening' | 'baseline';
+export type Screen = 'chat' | 'hardening' | 'baseline' | 'install';
 
 export type TextColor = Parameters<typeof Text>[0]['color'];

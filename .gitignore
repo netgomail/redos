@@ -22,3 +22,7 @@ Thumbs.db
 # Логи
 *.log
 npm-debug.log*
+
+temp/
+INFRASTRUCTURE.md
+INSTALL-FEATURE-PLAN.md

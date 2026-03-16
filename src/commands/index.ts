@@ -3,6 +3,7 @@ import { collectInventory, formatInventory } from '../features/inventory';
 import { runAudit, formatAudit } from '../features/audit';
 import { runFirewallAnalysis, formatFirewall } from '../features/firewall';
 import { runLogAnalysis, formatLogs } from '../features/logs';
+import { loadConfig, saveConfig, maskSecret } from '../features/packages/config';
 import type { Screen } from '../types';
 
 export interface CommandDef {
@@ -16,10 +17,12 @@ export const COMMANDS: CommandDef[] = [
   { name: '/audit',     description: 'аудит пользователей и файловой системы', usage: '/audit [файл.txt]', showInTips: true },
   { name: '/baseline',  description: 'CIS Benchmark для РедОС/RHEL', showInTips: true },
   { name: '/clear',     description: 'очистить историю' },
+  { name: '/config',    description: 'настройка сервера пакетов', usage: '/config [server|secret] [значение]' },
   { name: '/exit',      description: 'завершить работу' },
   { name: '/firewall',  description: 'анализ фаервола и SELinux', usage: '/firewall [файл.txt]', showInTips: true },
   { name: '/hardening', description: 'чеклист харденинга Linux', showInTips: true },
   { name: '/help',      description: 'показать список команд', showInTips: true },
+  { name: '/install',   description: 'установка пакетов с сервера', showInTips: true },
   { name: '/inventory', description: 'инвентаризация системы', usage: '/inventory [файл.txt]', showInTips: true },
   { name: '/logs',      description: 'анализ логов безопасности', usage: '/logs [файл.txt]', showInTips: true },
   { name: '/quit',      description: 'завершить работу' },
@@ -126,6 +129,45 @@ async function handleLogs(add: AddFn, arg: string) {
   await runWithProgress(add, arg, 'Анализ логов безопасности...', runLogAnalysis, formatLogs);
 }
 
+function handleConfig(add: AddFn, arg: string) {
+  const config = loadConfig();
+  const parts = arg.trim().split(/\s+/);
+  const key = parts[0];
+  const value = parts.slice(1).join(' ');
+
+  if (!key) {
+    // Показать текущий конфиг
+    add('system', [
+      'Конфигурация:',
+      `  server: ${config.server || '(не задан)'}`,
+      `  secret: ${maskSecret(config.secret)}`,
+    ].join('\n'));
+    return;
+  }
+
+  if (key === 'server') {
+    if (!value) { add('error', 'Укажите адрес: /config server http://...'); return; }
+    config.server = value.replace(/\/+$/, ''); // убрать trailing slash
+    saveConfig(config);
+    add('system', `✓ Сервер: ${config.server}`);
+    return;
+  }
+
+  if (key === 'secret') {
+    if (!value) { add('error', 'Укажите секрет: /config secret <ключ>'); return; }
+    config.secret = value;
+    saveConfig(config);
+    add('system', `✓ Секрет сохранён: ${maskSecret(config.secret)}`);
+    return;
+  }
+
+  add('error', 'Неизвестный параметр: ' + key + '. Доступные: server, secret');
+}
+
+function handleInstall(add: AddFn, openScreen: (s: Screen) => void) {
+  openScreen('install');
+}
+
 // ─── hook ────────────────────────────────────────────────────────────────────
 
 export function useCommands(
@@ -144,7 +186,9 @@ export function useCommands(
       case '/baseline':  handleBaseline(add, openScreen); break;
       case '/inventory': handleInventory(add, arg); break;
       case '/audit':     handleAudit(add, arg); break;
+      case '/config':    handleConfig(add, arg); break;
       case '/firewall':  handleFirewall(add, arg); break;
+      case '/install':   handleInstall(add, openScreen); break;
       case '/logs':      handleLogs(add, arg); break;
       default:           add('error', 'Неизвестная команда: ' + cmd + '  (введите /help)');
     }
