@@ -15,46 +15,29 @@ const devtoolsStubPlugin = {
   },
 };
 
-// Все поддерживаемые платформы
-const TARGETS = {
-  'bun-linux-x64':    { outfile: 'dist/redos-linux',   label: 'Linux x64'   },
-  'bun-darwin-x64':   { outfile: 'dist/redos-mac-x64', label: 'macOS x64'   },
-  'bun-darwin-arm64': { outfile: 'dist/redos-mac-arm', label: 'macOS ARM64' },
-};
-
-async function buildTarget(target, outfile, label) {
-  const result = await Bun.build({
-    entrypoints: ['./src/app.tsx'],
-    compile: { outfile, target },
-    define: {
-      'process.env.NODE_ENV': '"production"',
-      'process.env.DEV':      '"false"',
-    },
-    plugins: [devtoolsStubPlugin],
-  });
-
-  if (result.success) {
-    const size = (Bun.file(outfile).size / 1024 / 1024).toFixed(1);
-    console.log(`  v  ${label.padEnd(14)} -> ${outfile}  (${size} MB)`);
-  } else {
-    console.error(`  X  ${label} FAILED`);
-    result.logs.forEach(l => console.error('    ', l));
-  }
-}
-
-const arg = process.argv[2]; // --all | --linux | --mac | (пусто = все)
+const TARGET  = 'bun-linux-x64';
+const OUTFILE = 'dist/redos-linux';
+const LABEL   = 'Linux x64';
 
 console.log('\n  Building РедОС...\n');
 
-if (arg === '--linux') {
-  await buildTarget('bun-linux-x64', 'dist/redos-linux', 'Linux x64');
-} else if (arg === '--mac') {
-  await buildTarget('bun-darwin-x64',   'dist/redos-mac-x64', 'macOS x64');
-  await buildTarget('bun-darwin-arm64', 'dist/redos-mac-arm', 'macOS ARM64');
+const result = await Bun.build({
+  entrypoints: ['./src/app.tsx'],
+  compile: { outfile: OUTFILE, target: TARGET },
+  define: {
+    'process.env.NODE_ENV': '"production"',
+    'process.env.DEV':      '"false"',
+  },
+  plugins: [devtoolsStubPlugin],
+});
+
+if (result.success) {
+  const size = (Bun.file(OUTFILE).size / 1024 / 1024).toFixed(1);
+  console.log(`  v  ${LABEL}  ->  ${OUTFILE}  (${size} MB)`);
 } else {
-  for (const [target, { outfile, label }] of Object.entries(TARGETS)) {
-    await buildTarget(target, outfile, label);
-  }
+  console.error(`  X  ${LABEL} FAILED`);
+  result.logs.forEach(l => console.error('    ', l));
+  process.exit(1);
 }
 
 console.log('\n  Done!\n');

@@ -1,6 +1,6 @@
 # РедОС
 
-> Консольная утилита для специалиста по защите информации — аудит безопасности, харденинг и инвентаризация Linux-систем. Заточена под РедОС 7/8 (RHEL-based).
+> Консольная утилита для специалиста по защите информации — настройка парольной политики, установка пакетов и инвентаризация Linux-систем. Заточена под РедОС 7/8 (RHEL-based).
 
 ---
 
@@ -33,13 +33,10 @@ bun start
 
 ---
 
-## Сборка бинарников
+## Сборка бинарника
 
 ```bash
-bun run build         # все платформы (Linux + macOS)
-bun run build:linux   # → dist/redos-linux      (Linux x64)
-bun run build:mac     # → dist/redos-mac-x64    (macOS x64)
-#                       dist/redos-mac-arm      (macOS ARM64)
+bun run build   # → dist/redos-linux  (Linux x64)
 ```
 
 ---
@@ -54,20 +51,11 @@ bun run build:mac     # → dist/redos-mac-x64    (macOS x64)
 | `/clear` | Очистить историю |
 | `/exit` / `/quit` | Завершить работу |
 
-### Аудит безопасности
+### Безопасность
 
 | Команда | Описание |
 |---|---|
-| `/audit [файл.txt]` | Аудит пользователей и файловой системы — пароли, SUID/SGID, world-writable, опции монтирования. **Только Linux.** |
-| `/logs [файл.txt]` | Анализ логов безопасности — неудачные SSH-входы, sudo, блокировки, SELinux denials, критические события journalctl. **Только Linux.** |
-| `/firewall [файл.txt]` | Анализ фаервола — статус firewalld, зоны, правила, порты, SELinux. Fallback на iptables. **Только Linux.** |
-
-### Харденинг и соответствие
-
-| Команда | Описание |
-|---|---|
-| `/hardening` | Интерактивный чеклист харденинга Linux — 10 проверок SSH, PAM, firewalld, auditd, ядра. `↑↓` навигация, `F` автофикс, `E` экспорт, `Q` выход. **Только Linux.** |
-| `/baseline` | CIS Benchmark для РедОС/RHEL — ~25 проверок по стандарту CIS Level 1: файловые системы, сервисы, сеть, аудит, аутентификация, права файлов. `↑↓` навигация, `F` автофикс, `E` экспорт, `Q` выход. **Только Linux.** |
+| `/passwd-policy` | Парольная политика — сложность пароля, срок смены, принудительная смена при входе. Требует root (запросит через polkit в графической сессии). **Только Linux.** |
 
 ### Инвентаризация
 
@@ -75,71 +63,32 @@ bun run build:mac     # → dist/redos-mac-x64    (macOS x64)
 |---|---|
 | `/inventory [файл.txt]` | Инвентаризация системы: ОС, железо, диски, пользователи, сеть, открытые порты, сервисы. |
 
-Все команды с `[файл.txt]` поддерживают экспорт — без аргумента вывод в терминал, с аргументом — сохранение в файл.
+### Установка пакетов
+
+| Команда | Описание |
+|---|---|
+| `/install` | Установка пакетов с настроенного сервера. Требует root. **Только Linux.** |
+| `/config [server\|secret] [значение]` | Настройка адреса сервера и секрета для `/install`. |
 
 ---
 
-## Детали проверок
+## `/passwd-policy` — детали
 
-### `/hardening` — чеклист харденинга
+Полноэкранный режим с тремя действиями:
 
-| Категория | Проверка |
+- **Применить пресет «Базовая»** — `minlen=8`, `minclass=3`, `PASS_MAX_DAYS=90`. Опционально применяет `chage -M -m -W` к выбранным пользователям.
+- **Применить пресет «Усиленная»** — `minlen=12`, `minclass=4`, `PASS_MAX_DAYS=60`. То же самое для существующих пользователей.
+- **Форсировать смену пароля при входе** — `chage -d 0` для выбранных пользователей; при ближайшем входе система потребует новый пароль.
+
+Куда пишутся настройки:
+
+| Файл | Что |
 |---|---|
-| SSH | PermitRootLogin = no / prohibit-password |
-| SSH | PasswordAuthentication = no |
-| SSH | MaxAuthTries ≤ 5 |
-| PAM / Пароли | Минимальная длина пароля ≥ 8 |
-| PAM / Пароли | pam_pwquality или pam_cracklib подключён |
-| Firewall | firewalld активен |
-| auditd | Служба auditd запущена |
-| USB | usb-storage заблокирован в modprobe |
-| Ядро | ASLR включён (randomize_va_space = 2) |
-| Ядро | SYN-cookies включены (tcp_syncookies = 1) |
+| `/etc/security/pwquality.conf.d/50-redos.conf` | Параметры сложности (drop-in, основной `pwquality.conf` не трогается) |
+| `/etc/login.defs` | `PASS_MAX_DAYS`, `PASS_MIN_DAYS`, `PASS_WARN_AGE`. Перед записью создаётся `*.bak.YYYYMMDD-HHMMSS` |
+| `/etc/shadow` (через `chage`) | Сроки и флаг «сменить при входе» для существующих пользователей |
 
-### `/baseline` — CIS Benchmark RHEL 7/8
-
-| Категория | Проверки |
-|---|---|
-| Файловые системы | /tmp отдельный раздел (noexec,nosuid,nodev), /var/tmp, blacklist cramfs/squashfs/udf |
-| Сервисы | xinetd не установлен, chronyd настроен, avahi/cups отключены, ненужные сетевые сервисы |
-| Сеть | IP forwarding отключён, ICMP redirects, source routing, TCP SYN cookies |
-| Аудит | auditd запущен, правила аудита /etc/passwd+shadow+group, rsyslog |
-| Аутентификация | Парольная политика (minlen, minclass), pam_faillock, TMOUT, umask |
-| Права файлов | /etc/passwd, /etc/shadow, /etc/group, /etc/gshadow, sshd_config, crontab |
-
-### `/audit` — аудит пользователей
-
-| Секция | Что проверяется |
-|---|---|
-| Пользователи | UID ≥ 1000, shell, домашняя папка, UID 0 кроме root |
-| Пароли | Пустые пароли, возраст > 90 дней |
-| Привилегии | Группа wheel, файлы в /etc/sudoers.d |
-| SUID/SGID | Файлы с битами SUID и SGID (топ-25) |
-| World-writable | Директории с правами записи для всех |
-| Без владельца | Файлы без существующего владельца/группы |
-| Монтирование | Опции nosuid, noexec, nodev на /tmp, /var/tmp, /dev/shm |
-
-### `/firewall` — анализ фаервола
-
-| Секция | Что анализируется |
-|---|---|
-| Статус | firewalld активен / включён в автозапуск |
-| Зоны | Активные зоны, зона по умолчанию, правила по зонам |
-| Rich rules | Расширенные правила firewalld |
-| Порты | Открытые порты (ss -tlnp) |
-| iptables | Fallback если firewalld не установлен |
-| SELinux | Режим (Enforcing/Permissive/Disabled), sestatus |
-
-### `/logs` — анализ логов безопасности
-
-| Секция | Источник |
-|---|---|
-| Неудачные SSH-входы | /var/log/secure — агрегация по IP, топ-10 |
-| Успешные SSH-входы | /var/log/secure — последние 20 |
-| Операции sudo | /var/log/secure — последние 30 |
-| Блокировки | pam_faillock записи |
-| Критические события | journalctl -p err за 24 часа |
-| SELinux denials | /var/log/audit/audit.log — avc denied |
+PAM-стек `/etc/pam.d/system-auth` / `password-auth` **не редактируется** — он управляется `authselect`. `pam_pwquality` уже подключён в нём по умолчанию и подхватывает drop-in.
 
 ---
 
@@ -157,27 +106,25 @@ redos/
 │   │   ├── Messages.tsx     — UserMessage, SystemMessage, ErrorMessage
 │   │   ├── Suggestions.tsx  — выпадающий список автодополнения
 │   │   ├── InputBox.tsx     — строка ввода
-│   │   ├── HardeningScreen.tsx  — полноэкранный чеклист харденинга
-│   │   └── BaselineScreen.tsx   — полноэкранный CIS Benchmark
+│   │   ├── InstallScreen.tsx        — установка пакетов
+│   │   └── PasswordPolicyScreen.tsx — парольная политика
 │   ├── hooks/
 │   │   ├── useMessages.ts   — состояние сообщений
 │   │   └── useInputState.ts — ввод, история, автодополнение
 │   ├── commands/
 │   │   └── index.ts         — реестр команд (CommandDef[]) и обработчики
 │   ├── features/
-│   │   ├── hardening.ts     — проверки харденинга Linux
-│   │   ├── baseline.ts      — проверки CIS Benchmark RHEL
-│   │   ├── audit.ts         — аудит пользователей и ФС
-│   │   ├── firewall.ts      — анализ firewalld/iptables/SELinux
-│   │   ├── logs.ts          — анализ логов безопасности
-│   │   └── inventory.ts     — инвентаризация системы
+│   │   ├── inventory.ts     — инвентаризация системы
+│   │   ├── passwordPolicy.ts — чтение/запись парольной политики, chage
+│   │   └── packages/        — установщик пакетов с сервера
 │   └── utils/
 │       ├── update.ts        — само-обновление
+│       ├── sudo.ts          — sudoRun / writeSudo / pkexec re-exec
 │       └── fs.ts            — общий readFile()
 ├── dist/                    — скомпилированные бинарники (не в git)
 ├── bunbuild.mjs             — скрипт сборки
 ├── tsconfig.json
-├── install.sh               — установщик Linux/macOS
+├── install.sh               — установщик Linux x86_64
 └── package.json             — версия (единственный источник)
 ```
 
@@ -189,7 +136,7 @@ redos/
 |---|---|
 | [TypeScript](https://www.typescriptlang.org) | Типизация |
 | [React](https://react.dev) 19 | Компонентный UI |
-| [Ink](https://github.com/vadimdemedes/ink) 6 | Рендеринг React в терминале |
+| [Ink](https://github.com/vadimdemedes/ink) 7 | Рендеринг React в терминале |
 | [Bun](https://bun.sh) | Runtime + компилятор в бинарник |
 
 ---

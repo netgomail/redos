@@ -58,12 +58,36 @@ function sectionSystem(): InventorySection {
 
   if (isLinux) {
     const osRelease = readFile('/etc/os-release');
+    let prettyName  = '';
+    let versionId   = '';
+    let edition     = '';
     if (osRelease) {
-      const name    = osRelease.match(/^PRETTY_NAME="?([^"\n]+)/m)?.[1] ?? '';
-      const version = osRelease.match(/^VERSION_ID="?([^"\n]+)/m)?.[1]  ?? '';
-      if (name)    lines.push(`ОС:             ${name}`);
-      if (version) lines.push(`Версия ОС:      ${version}`);
+      prettyName = osRelease.match(/^PRETTY_NAME="?([^"\n]+)"?/m)?.[1]?.replace(/"$/, '') ?? '';
+      versionId  = osRelease.match(/^VERSION_ID="?([^"\n]+)"?/m)?.[1]?.replace(/"$/, '')  ?? '';
+      edition    = osRelease.match(/^EDITION="?([^"\n]+)"?/m)?.[1]?.replace(/"$/, '')     ?? '';
     }
+
+    // Редакция (DESKTOP / SERVER / WORKSTATION) живёт в /etc/redos-release или /etc/system-release.
+    const releaseFile = readFile('/etc/redos-release') ?? readFile('/etc/system-release') ?? '';
+    const redosEdition = releaseFile.match(/release\s*\(\s*[\d.]+\s*\)\s+(\S+)/i)?.[1] ?? '';
+
+    // Собираем человекочитаемую строку: «RED OS 8.0 — DESKTOP, Certified Edition»
+    if (prettyName) {
+      const tags: string[] = [];
+      if (redosEdition) tags.push(redosEdition);
+      if (edition)      tags.push(`${edition} Edition`);
+      const suffix = tags.length ? ` — ${tags.join(', ')}` : '';
+      lines.push(`ОС:             ${prettyName}${suffix}`);
+    }
+    if (versionId) lines.push(`Версия ОС:      ${versionId}`);
+
+    // ID сборки ISO (полезно для журнала: однозначно идентифицирует образ установки).
+    const isoid = readFile('/etc/redos-isoid');
+    if (isoid) {
+      const iso = isoid.match(/ID:\s*(\S+)/)?.[1];
+      if (iso) lines.push(`Сборка ISO:     ${iso}`);
+    }
+
     const kernel = spawn(['uname', '-r']);
     if (kernel) lines.push(`Ядро:           ${kernel}`);
   } else if (isWindows) {
@@ -109,6 +133,121 @@ function sectionDisks(): InventorySection {
 
   if (lines.length === 0) lines = ['Нет данных'];
   return { title: 'Диски', lines };
+}
+
+// Серийник USB-устройства с уровня самого устройства (тот, что обычно на наклейке).
+// lsblk для USB возвращает SCSI-инкапсулированный serial — он может отличаться.
+function getUsbSerial(devNode: string): { vendor: string; product: string; serial: string } | null {
+  const out = spawn(['udevadm', 'info', '-a', '-n', devNode]);
+  if (!out) return null;
+  for (const block of out.split(/looking at parent device/)) {
+    const v = block.match(/ATTRS\{idVendor\}=="([^"]+)"/)?.[1];
+    const p = block.match(/ATTRS\{idProduct\}=="([^"]+)"/)?.[1];
+    const s = block.match(/ATTRS\{serial\}=="([^"]+)"/)?.[1];
+    if (v && p && s && !/xHCI Host Controller|xhci-hcd/.test(block)) {
+      return { vendor: v, product: p, serial: s };
+    }
+  }
+  return null;
+}
+
+interface LsblkDisk {
+  name:    string;
+  type:    string;
+  size:    number;
+  model?:  string | null;
+  serial?: string | null;
+  vendor?: string | null;
+  tran?:   string | null;
+  rota:    boolean;
+  rm:      boolean;
+  hotplug: boolean;
+  wwn?:    string | null;
+}
+
+function classifyDisk(d: LsblkDisk): string {
+  const tran = (d.tran || '').toLowerCase();
+  if (tran === 'nvme') return 'NVMe SSD';
+  if (tran === 'sata') return d.rota ? 'SATA HDD' : 'SATA SSD';
+  if (tran === 'sas')  return d.rota ? 'SAS HDD'  : 'SAS SSD';
+  if (tran === 'usb')  return d.rm   ? 'USB-флешка' : 'USB-накопитель';
+  if (tran === 'mmc')  return 'SD-карта';
+  if (tran)            return tran.toUpperCase();
+  return d.rota ? 'HDD' : 'SSD';
+}
+
+function sectionStorageMedia(): InventorySection {
+  const lines: string[] = [];
+
+  if (!isLinux) {
+    return { title: 'Носители информации (журнал учёта МН)', lines: ['Доступно только на Linux'] };
+  }
+
+  const json = spawn([
+    'lsblk', '-J', '-d', '-b',
+    '-o', 'NAME,TYPE,SIZE,MODEL,SERIAL,VENDOR,TRAN,ROTA,RM,HOTPLUG,WWN',
+  ]);
+  if (!json) {
+    return { title: 'Носители информации (журнал учёта МН)', lines: ['lsblk недоступен'] };
+  }
+
+  let parsed: { blockdevices?: LsblkDisk[] };
+  try { parsed = JSON.parse(json); }
+  catch { return { title: 'Носители информации (журнал учёта МН)', lines: ['ошибка разбора lsblk'] }; }
+
+  // Только физические носители: исключаем zram, loop и подобное виртуальное.
+  // У них tran пустой и /sys-имя начинается с zram/loop/dm/md/sr.
+  const disks = (parsed.blockdevices ?? []).filter(d =>
+    d.type === 'disk' && !/^(zram|loop|dm-|md|ram|sr)/i.test(d.name),
+  );
+  if (disks.length === 0) return { title: 'Носители информации (журнал учёта МН)', lines: ['Носителей не найдено'] };
+
+  let idx = 1;
+  for (const d of disks) {
+    const tran        = (d.tran || '').toLowerCase();
+    const kind        = classifyDisk(d);
+    const sizeStr     = d.size > 0 ? fmtBytes(d.size) : '— (носитель не вставлен)';
+    const model       = [d.vendor?.trim(), d.model?.trim()].filter(Boolean).join(' ') || '—';
+    const driveSerial = (d.serial || '').trim();
+    let   usbSerial   = '';
+    let   usbId       = '';
+
+    // Для USB читаем серийник с USB-уровня (моста / контроллера).
+    // У USB-флешек это совпадает с тем, что на корпусе.
+    // У USB-SSD/HDD (внешний диск через USB-SATA bridge) это серийник МОСТА,
+    // а на корпусе самого диска — driveSerial с ATA/SCSI-уровня.
+    if (tran === 'usb') {
+      const usb = getUsbSerial(`/dev/${d.name}`);
+      if (usb) {
+        usbSerial = usb.serial;
+        usbId     = `${usb.vendor}:${usb.product}`;
+      }
+    }
+
+    // Для журнала учёта: USB и SD считаем съёмными независимо от RM-бита
+    // (USB-SSD у него RM=0, но физически устройство всё равно отчуждаемо).
+    const removable = tran === 'usb' || tran === 'mmc' || d.rm;
+
+    lines.push(`[${idx}]  ${kind}  ${sizeStr}  /dev/${d.name}`);
+    lines.push(`     Модель:    ${model}`);
+
+    if (usbSerial && driveSerial && usbSerial !== driveSerial) {
+      // Внешний накопитель: показываем оба, чтобы пользователь выбрал нужный для журнала
+      lines.push(`     S/N диска: ${driveSerial}`);
+      lines.push(`     S/N USB:   ${usbSerial}`);
+    } else {
+      lines.push(`     S/N:       ${usbSerial || driveSerial || '—'}`);
+    }
+    if (usbId) lines.push(`     USB ID:    ${usbId}`);
+    if (d.wwn) lines.push(`     WWN:       ${d.wwn}`);
+    lines.push(`     Носитель:  ${removable ? 'съёмный (отчуждаемый)' : 'фиксированный (внутренний)'}`);
+    lines.push('');
+    idx++;
+  }
+  // убираем хвостовую пустую строку
+  while (lines.length && lines[lines.length - 1] === '') lines.pop();
+
+  return { title: 'Носители информации (журнал учёта МН)', lines };
 }
 
 function sectionUsers(): InventorySection {
@@ -171,35 +310,17 @@ function sectionPorts(): InventorySection {
   return { title: 'Открытые порты', lines };
 }
 
-function sectionServices(): InventorySection {
-  if (!isLinux) return { title: 'Сервисы', lines: ['Доступно только на Linux'] };
-
-  const out = spawn([
-    'systemctl', 'list-units', '--type=service', '--state=running',
-    '--no-pager', '--no-legend',
-  ]);
-
-  if (!out) return { title: 'Сервисы', lines: ['Не удалось получить список (systemctl не найден)'] };
-
-  const lines = out.split('\n')
-    .filter(l => l.trim())
-    .map(l => l.replace(/\s+/g, ' ').trim())
-    .slice(0, MAX_OUTPUT_LINES);
-
-  return { title: `Активные сервисы (${lines.length})`, lines };
-}
-
 // ─── public API ───────────────────────────────────────────────────────────────
 
 export async function collectInventory(): Promise<InventorySection[]> {
   return [
     sectionSystem(),
     sectionHardware(),
+    sectionStorageMedia(),
     sectionDisks(),
     sectionUsers(),
     sectionNetwork(),
     sectionPorts(),
-    sectionServices(),
   ];
 }
 

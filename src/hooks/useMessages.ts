@@ -23,5 +23,5 @@ export function useMessages() {
 
   const clear = () => dispatch({ type: 'clear' });
 
-  return { messages, add, clear, dispatch };
+  return { messages, add, clear };
 }

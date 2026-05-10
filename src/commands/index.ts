@@ -1,10 +1,8 @@
 import { useCallback } from 'react';
 import { collectInventory, formatInventory } from '../features/inventory';
-import { runAudit, formatAudit } from '../features/audit';
-import { runFirewallAnalysis, formatFirewall } from '../features/firewall';
-import { runLogAnalysis, formatLogs } from '../features/logs';
-import { loadConfig, saveConfig, maskSecret } from '../features/packages/config';
-import type { Screen } from '../types';
+import { isRoot, canPkexec, escalateViaPkexec } from '../utils/sudo';
+import { restartApp } from '../utils/restart';
+import type { Screen, MessageRole } from '../types';
 
 export interface CommandDef {
   name: string;
@@ -14,23 +12,18 @@ export interface CommandDef {
 }
 
 export const COMMANDS: CommandDef[] = [
-  { name: '/audit',     description: 'аудит пользователей и файловой системы', usage: '/audit [файл.txt]', showInTips: true },
-  { name: '/baseline',  description: 'CIS Benchmark для РедОС/RHEL', showInTips: true },
-  { name: '/clear',     description: 'очистить историю' },
-  { name: '/config',    description: 'настройка сервера пакетов', usage: '/config [server|secret] [значение]' },
-  { name: '/exit',      description: 'завершить работу' },
-  { name: '/firewall',  description: 'анализ фаервола и SELinux', usage: '/firewall [файл.txt]', showInTips: true },
-  { name: '/hardening', description: 'чеклист харденинга Linux', showInTips: true },
-  { name: '/help',      description: 'показать список команд', showInTips: true },
-  { name: '/install',   description: 'установка пакетов с сервера', showInTips: true },
-  { name: '/inventory', description: 'инвентаризация системы', usage: '/inventory [файл.txt]', showInTips: true },
-  { name: '/logs',      description: 'анализ логов безопасности', usage: '/logs [файл.txt]', showInTips: true },
-  { name: '/quit',      description: 'завершить работу' },
+  { name: '/clear',         description: 'очистить историю' },
+  { name: '/exit',          description: 'завершить работу' },
+  { name: '/help',          description: 'показать список команд', showInTips: true },
+  { name: '/inventory',     description: 'инвентаризация системы', usage: '/inventory [файл.txt]', showInTips: true },
+  { name: '/passwd-policy', description: 'парольная политика — сложность и срок смены', showInTips: true },
+  { name: '/usb-policy',    description: 'блокировка USB-накопителей и список доверенных', showInTips: true },
+  { name: '/quit',          description: 'завершить работу' },
 ];
 
 export const COMMAND_NAMES = COMMANDS.map(c => c.name);
 
-type AddFn = (role: 'user' | 'assistant' | 'system' | 'error', content: string) => void;
+type AddFn = (role: MessageRole, content: string) => void;
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
@@ -42,34 +35,39 @@ function linuxOnly(add: AddFn, label: string): boolean {
   return true;
 }
 
-type Section = { title: string; lines: string[] };
-type ProgressFn = (step: number, total: number, label: string) => void;
-type RunFn = (onProgress?: ProgressFn) => Promise<Section[]>;
-type FormatFn = (sections: Section[]) => string;
-
-async function runWithProgress(
+/**
+ * Проверяет права root. Если их нет — пытается перезапустить приложение через
+ * pkexec (системное окно polkit с запросом пароля). При отсутствии графики
+ * выводит подсказку про `sudo redos`. Возвращает true только если уже root.
+ *
+ * cmdName — имя команды («/passwd-policy» и т.п.) пробрасывается дочернему
+ * процессу через --auto-cmd, чтобы после успешной авторизации сразу открыть
+ * нужный экран. Если пользователь закрыл диалог pkexec, перезапускаем Ink в
+ * родителе с уведомлением — приложение остаётся открытым.
+ */
+async function requireRoot(
   add: AddFn,
-  arg: string,
-  startMsg: string,
-  run: RunFn,
-  format: FormatFn,
-) {
-  add('system', startMsg);
-  const sections = await run((step, total, label) => {
-    add('system', `  [${step}/${total}] ${label}...`);
-  });
-  const text = format(sections);
-  if (arg) {
-    const filename = arg.trim();
-    try {
-      await Bun.write(filename, text);
-      add('system', `✓ Отчёт сохранён: ${filename}`);
-    } catch {
-      add('error', 'Не удалось записать файл: ' + filename);
+  exit: () => void,
+  label: string,
+  cmdName: string,
+): Promise<boolean> {
+  if (isRoot()) return true;
+  if (canPkexec()) {
+    add('system', `⚙ ${label}: открываю окно polkit для запроса пароля администратора...`);
+    await new Promise<void>(r => setTimeout(r, 50));
+    exit();
+    const result = await escalateViaPkexec(cmdName);
+    if (result === 'cancelled') {
+      restartApp(`${label}: доступ отменён.`);
     }
-  } else {
-    add('system', text);
+    return false;
   }
+  add('error', [
+    `${label}: требуются права администратора.`,
+    '  В терминале:  sudo redos',
+    '  В графе: установите polkit и запустите снова — появится окно ввода пароля',
+  ].join('\n'));
+  return false;
 }
 
 // ─── handlers ────────────────────────────────────────────────────────────────
@@ -82,14 +80,6 @@ function handleHelp(add: AddFn) {
     lines.push(`  ${label} ${cmd.description}`);
   }
   add('system', lines.join('\n'));
-}
-
-function handleHardening(add: AddFn, openScreen: (s: Screen) => void) {
-  if (linuxOnly(add, 'Чеклист харденинга')) openScreen('hardening');
-}
-
-function handleBaseline(add: AddFn, openScreen: (s: Screen) => void) {
-  if (linuxOnly(add, 'CIS Baseline')) openScreen('baseline');
 }
 
 async function handleInventory(add: AddFn, arg: string) {
@@ -114,58 +104,16 @@ async function handleInventory(add: AddFn, arg: string) {
   }
 }
 
-async function handleAudit(add: AddFn, arg: string) {
-  if (!linuxOnly(add, 'Аудит безопасности')) return;
-  await runWithProgress(add, arg, 'Аудит безопасности...', runAudit, formatAudit);
+async function handlePasswdPolicy(add: AddFn, openScreen: (s: Screen) => void, exit: () => void) {
+  if (!linuxOnly(add, 'Парольная политика')) return;
+  if (!await requireRoot(add, exit, 'Парольная политика', '/passwd-policy')) return;
+  openScreen('passwd-policy');
 }
 
-async function handleFirewall(add: AddFn, arg: string) {
-  if (!linuxOnly(add, 'Анализ фаервола')) return;
-  await runWithProgress(add, arg, 'Анализ фаервола...', runFirewallAnalysis, formatFirewall);
-}
-
-async function handleLogs(add: AddFn, arg: string) {
-  if (!linuxOnly(add, 'Анализ логов')) return;
-  await runWithProgress(add, arg, 'Анализ логов безопасности...', runLogAnalysis, formatLogs);
-}
-
-function handleConfig(add: AddFn, arg: string) {
-  const config = loadConfig();
-  const parts = arg.trim().split(/\s+/);
-  const key = parts[0];
-  const value = parts.slice(1).join(' ');
-
-  if (!key) {
-    // Показать текущий конфиг
-    add('system', [
-      'Конфигурация:',
-      `  server: ${config.server || '(не задан)'}`,
-      `  secret: ${maskSecret(config.secret)}`,
-    ].join('\n'));
-    return;
-  }
-
-  if (key === 'server') {
-    if (!value) { add('error', 'Укажите адрес: /config server http://...'); return; }
-    config.server = value.replace(/\/+$/, ''); // убрать trailing slash
-    saveConfig(config);
-    add('system', `✓ Сервер: ${config.server}`);
-    return;
-  }
-
-  if (key === 'secret') {
-    if (!value) { add('error', 'Укажите секрет: /config secret <ключ>'); return; }
-    config.secret = value;
-    saveConfig(config);
-    add('system', `✓ Секрет сохранён: ${maskSecret(config.secret)}`);
-    return;
-  }
-
-  add('error', 'Неизвестный параметр: ' + key + '. Доступные: server, secret');
-}
-
-function handleInstall(add: AddFn, openScreen: (s: Screen) => void) {
-  openScreen('install');
+async function handleUsbPolicy(add: AddFn, openScreen: (s: Screen) => void, exit: () => void) {
+  if (!linuxOnly(add, 'Политика USB')) return;
+  if (!await requireRoot(add, exit, 'Политика USB', '/usb-policy')) return;
+  openScreen('usb-policy');
 }
 
 // ─── hook ────────────────────────────────────────────────────────────────────
@@ -179,18 +127,13 @@ export function useCommands(
   return useCallback((cmd: string, arg: string) => {
     switch (cmd) {
       case '/exit':
-      case '/quit':      exit(); break;
-      case '/clear':     clear(); break;
-      case '/help':      handleHelp(add); break;
-      case '/hardening': handleHardening(add, openScreen); break;
-      case '/baseline':  handleBaseline(add, openScreen); break;
-      case '/inventory': handleInventory(add, arg); break;
-      case '/audit':     handleAudit(add, arg); break;
-      case '/config':    handleConfig(add, arg); break;
-      case '/firewall':  handleFirewall(add, arg); break;
-      case '/install':   handleInstall(add, openScreen); break;
-      case '/logs':      handleLogs(add, arg); break;
-      default:           add('error', 'Неизвестная команда: ' + cmd + '  (введите /help)');
+      case '/quit':          exit(); break;
+      case '/clear':         clear(); break;
+      case '/help':          handleHelp(add); break;
+      case '/inventory':     handleInventory(add, arg); break;
+      case '/passwd-policy': handlePasswdPolicy(add, openScreen, exit); break;
+      case '/usb-policy':    handleUsbPolicy(add, openScreen, exit); break;
+      default:               add('error', 'Неизвестная команда: ' + cmd + '  (введите /help)');
     }
   }, [add, clear, exit, openScreen]);
 }

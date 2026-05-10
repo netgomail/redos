@@ -1,6 +1,6 @@
 import type { Text } from 'ink';
 
-export type MessageRole = 'user' | 'assistant' | 'system' | 'error';
+export type MessageRole = 'user' | 'system' | 'error';
 
 export interface Message {
   id: number;
@@ -8,6 +8,6 @@ export interface Message {
   content: string;
 }
 
-export type Screen = 'chat' | 'hardening' | 'baseline' | 'install';
+export type Screen = 'chat' | 'passwd-policy' | 'usb-policy';
 
 export type TextColor = Parameters<typeof Text>[0]['color'];

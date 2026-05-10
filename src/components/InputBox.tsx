@@ -14,7 +14,7 @@ export function InputBox({ value, suggestions, sugIdx }: Props) {
   const hasSugs = suggestions.length > 0;
 
   return (
-    <Box flexDirection="column" marginTop={1}>
+    <Box flexDirection="column">
       <Box
         borderStyle="round"
         borderColor="cyan"
@@ -31,7 +31,7 @@ export function InputBox({ value, suggestions, sugIdx }: Props) {
 
       {hasSugs && <Suggestions items={suggestions} selectedIdx={sugIdx} typed={value} />}
 
-      <Box paddingLeft={2}>
+      <Box paddingLeft={2} marginTop={hasSugs ? 1 : 0}>
         <Text color="gray" dimColor>
           {hasSugs
             ? 'Tab/Enter выбрать  ·  ↑↓ навигация  ·  Esc закрыть'

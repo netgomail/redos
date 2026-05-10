@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# redos — установщик для Linux и macOS
-# Использование: curl -fsSL https://raw.githubusercontent.com/YOURNAME/redos/main/install.sh | bash
+# redos — установщик для РедОС / RHEL-совместимых дистрибутивов Linux x86_64
+# Использование: curl -fsSL https://raw.githubusercontent.com/netgomail/redos/master/install.sh | bash
 set -e
 
 REPO="netgomail/redos"
 INSTALL_DIR="$HOME/.local/bin"
 APP="redos"
+BINARY_NAME="redos-linux"
 
 # ── Цвета ────────────────────────────────────────────────────────────────────
 CYAN='\033[0;36m'; GREEN='\033[0;32m'; RED='\033[0;31m'
@@ -16,63 +17,45 @@ ok()      { echo -e "  ${GREEN}v${NC}  $*"; }
 warn()    { echo -e "  ${YELLOW}!${NC}  ${GRAY}$*${NC}"; }
 fail()    { echo -e "  ${RED}X${NC}  $*" >&2; exit 1; }
 
+# ── Проверка платформы ───────────────────────────────────────────────────────
+OS="$(uname -s)"; ARCH="$(uname -m)"
+[ "$OS" = "Linux" ] || fail "Поддерживается только Linux (получено: $OS)"
+case "$ARCH" in
+  x86_64|amd64) ;;
+  *) fail "Поддерживается только x86_64 (получено: $ARCH)" ;;
+esac
+
 # ── Получаем последнюю версию из GitHub API ───────────────────────────────────
-command -v curl &>/dev/null || fail "curl is required but not installed"
+command -v curl &>/dev/null || fail "Требуется curl"
 VERSION=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
   | grep '"tag_name"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/')
-[ -z "$VERSION" ] && fail "Failed to fetch latest version from GitHub"
+[ -z "$VERSION" ] && fail "Не удалось получить последнюю версию с GitHub"
 
 echo ""
 echo -e "  ${CYAN}+--------------------------------------------------+${NC}"
-echo -e "  ${CYAN}|${NC}  ${BOLD}RedOS${NC} Installer  ${GRAY}v${VERSION}${NC}"
+echo -e "  ${CYAN}|${NC}  ${BOLD}РедОС${NC} Installer  ${GRAY}v${VERSION}${NC}"
 echo -e "  ${CYAN}|${NC}  ${GRAY}https://github.com/${REPO}${NC}"
 echo -e "  ${CYAN}+--------------------------------------------------+${NC}"
 echo ""
 
-# ── Определяем платформу ─────────────────────────────────────────────────────
-OS="$(uname -s)"; ARCH="$(uname -m)"
-case "$OS" in
-  Linux*)  PLATFORM="linux" ;;
-  Darwin*) PLATFORM="mac"   ;;
-  *)       fail "Unsupported OS: $OS" ;;
-esac
-case "$ARCH" in
-  x86_64|amd64) ARCH_SUFFIX="" ;;       # linux -> redos-linux, mac -> redos-mac-x64
-  arm64|aarch64)
-    if [ "$PLATFORM" = "mac" ]; then
-      ARCH_SUFFIX="-arm"
-    else
-      fail "Linux ARM64 not yet supported"
-    fi ;;
-  *) fail "Unsupported architecture: $ARCH" ;;
-esac
-
-if [ "$PLATFORM" = "linux" ]; then
-  BINARY_NAME="redos-linux"
-elif [ "$ARCH" = "arm64" ] || [ "$ARCH" = "aarch64" ]; then
-  BINARY_NAME="redos-mac-arm"
-else
-  BINARY_NAME="redos-mac-x64"
-fi
-
-step "Platform: ${PLATFORM} / ${ARCH}"
+step "Платформа: Linux / ${ARCH}"
 
 # ── Создаём папку ────────────────────────────────────────────────────────────
 mkdir -p "$INSTALL_DIR"
-step "Install directory: $INSTALL_DIR"
+step "Каталог установки: $INSTALL_DIR"
 
 # ── Скачиваем бинарник ───────────────────────────────────────────────────────
 DOWNLOAD_URL="https://github.com/${REPO}/releases/download/v${VERSION}/${BINARY_NAME}"
 TMP="$(mktemp)"
-step "Downloading ${BINARY_NAME}..."
+step "Скачиваю ${BINARY_NAME}..."
 if ! curl -fsSL --progress-bar "$DOWNLOAD_URL" -o "$TMP"; then
-  fail "Download failed: $DOWNLOAD_URL"
+  fail "Не удалось скачать: $DOWNLOAD_URL"
 fi
 
 # ── Устанавливаем ────────────────────────────────────────────────────────────
 chmod +x "$TMP"
 mv "$TMP" "${INSTALL_DIR}/${APP}"
-ok "Installed: ${INSTALL_DIR}/${APP}"
+ok "Установлено: ${INSTALL_DIR}/${APP}"
 
 # ── Добавляем в PATH (если нужно) ─────────────────────────────────────────────
 if ! echo "$PATH" | grep -q "$INSTALL_DIR"; then
@@ -83,17 +66,17 @@ if ! echo "$PATH" | grep -q "$INSTALL_DIR"; then
 
   if [ -n "$SHELL_RC" ]; then
     echo '' >> "$SHELL_RC"
-    echo '# RedOS' >> "$SHELL_RC"
+    echo '# РедОС' >> "$SHELL_RC"
     echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> "$SHELL_RC"
-    ok "Added to PATH in $SHELL_RC"
-    warn "Run: source $SHELL_RC  (or restart your terminal)"
+    ok "Добавлено в PATH: $SHELL_RC"
+    warn "Выполните: source $SHELL_RC  (или перезапустите терминал)"
   else
-    warn "Add to your shell config: export PATH=\"\$HOME/.local/bin:\$PATH\""
+    warn "Добавьте в shell-конфиг: export PATH=\"\$HOME/.local/bin:\$PATH\""
   fi
 else
-  ok "PATH already includes $INSTALL_DIR"
+  ok "PATH уже включает $INSTALL_DIR"
 fi
 
 echo ""
-echo -e "  ${GREEN}${BOLD}Done!${NC}  Type ${CYAN}${APP}${NC} to start"
+echo -e "  ${GREEN}${BOLD}Готово!${NC}  Запустите: ${CYAN}${APP}${NC}"
 echo ""
