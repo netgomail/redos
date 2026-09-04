@@ -205,14 +205,31 @@ async function detectServiceUnit(): Promise<string> {
   return 'usbguard.service';
 }
 
+/**
+ * Наличие usbguard определяется по файлу, а не запуском.
+ *
+ * У утилиты нет ни --version, ни --help как опции: `usbguard --version`
+ * печатает справку и выходит с кодом 1, а `usbguard` без аргументов —
+ * с кодом 0. То есть по коду возврата присутствие не определить, а по тексту
+ * тем более: сообщение runPty об отсутствующей команде само содержит слово
+ * «usbguard». Проверяем файл, версию спрашиваем у пакетного менеджера.
+ */
+const USBGUARD_PATHS = ['/usr/bin/usbguard', '/usr/sbin/usbguard', '/bin/usbguard'];
+
+function usbguardBinary(): string | null {
+  return USBGUARD_PATHS.find(p => existsSync(p)) ?? null;
+}
+
+async function packageVersion(): Promise<string> {
+  const out = await runPtyLines(['rpm', '-q', '--qf', '%{VERSION}', 'usbguard'],
+                                { env: C_LOCALE, timeoutMs: 10_000 });
+  const v = out.join('').trim();
+  return /^\d+\.\d+/.test(v) ? 'usbguard ' + v : '';
+}
+
 export async function readStatus(): Promise<GuardStatus> {
-  // Проверяем по коду возврата, а не по тексту: при отсутствии утилиты runPty
-  // возвращает код 127 и сообщение, в котором само слово «usbguard» и стоит.
-  const ver = await runPty(['usbguard', '--version'], { env: C_LOCALE, timeoutMs: 8000 });
-  const installed = ver.code === 0;
-  const verLine = installed
-    ? ver.output.split('\n').find(l => /\d+\.\d+/.test(l))?.trim() ?? ''
-    : '';
+  const installed = usbguardBinary() !== null;
+  const verLine = installed ? await packageVersion() : '';
 
   const base: GuardStatus = {
     installed,
@@ -368,6 +385,10 @@ export async function listDevices(): Promise<GuardDevice[]> {
 
 /** Ставит usbguard из репозитория. Пакет есть в штатном репозитории РЕД ОС. */
 export async function install(onStep: (m: string) => void = () => {}): Promise<FixResult> {
+  if (usbguardBinary()) {
+    onStep('usbguard уже установлен');
+    return { ok: true, msg: 'usbguard уже установлен' };
+  }
   onStep('Устанавливаю usbguard из репозитория...');
   const r = await runPty(['dnf', 'install', '-y', 'usbguard'], {
     env: C_LOCALE,
@@ -377,10 +398,12 @@ export async function install(onStep: (m: string) => void = () => {}): Promise<F
   if (r.code !== 0) {
     return { ok: false, msg: `dnf install usbguard завершился с кодом ${r.code}` };
   }
-  const st = await readStatus();
-  return st.installed
-    ? { ok: true, msg: `usbguard установлен${st.version ? ' (' + st.version + ')' : ''}` }
-    : { ok: false, msg: 'dnf отработал, но usbguard в системе не появился' };
+  const bin = usbguardBinary();
+  if (!bin) {
+    return { ok: false, msg: `dnf отработал, но исполняемого файла нет ни в одном из: ${USBGUARD_PATHS.join(', ')}` };
+  }
+  const ver = await packageVersion();
+  return { ok: true, msg: `Установлено: ${bin}${ver ? ' (' + ver + ')' : ''}` };
 }
 
 // ─── генерация политики ──────────────────────────────────────────────────────
