@@ -35,6 +35,22 @@ export const RULES_FILE  = '/etc/usbguard/rules.conf';
 export const DAEMON_CONF = '/etc/usbguard/usbguard-daemon.conf';
 const HEADER_MARK = '# redos-device-control: managed';
 
+/**
+ * Маркеры формата политики.
+ *
+ * Разрешённые категории записываются в файл явно, а не восстанавливаются потом
+ * из самих правил: обратный разбор угадывает намерение администратора по
+ * набору классов и ошибается, как только категория состоит больше чем из
+ * одного класса. «Сеть и модемы» — это 02 и 0a: стоит правилу потерять один из
+ * них, и категория прочитается как запрещённая, хотя запрещали не её.
+ *
+ * Версия нужна, чтобы следующий формат не пришлось опознавать по косвенным
+ * признакам. Файлы без маркеров (redos ≤ 0.11.1) читаются по-старому.
+ */
+const POLICY_VERSION  = 1;
+const VERSION_MARK    = '# redos-device-control-version:';
+const CATEGORIES_MARK = '# redos-device-control-categories:';
+
 const C_LOCALE = { LC_ALL: 'C', LANG: 'C', LANGUAGE: 'C' };
 
 // ─── категории устройств ─────────────────────────────────────────────────────
@@ -765,8 +781,17 @@ export function generateRules(input: PolicyInput): string {
     .filter(c => allowed.has(c.id))
     .flatMap(c => c.classes);   // категории, опознаваемые по id, идут отдельным правилом
 
+  // В маркер идут категории, задаваемые классами интерфейсов: токены и прочие
+  // опознаваемые по идентификатору живут отдельными правилами и в наборе
+  // «разрешённых категорий» не участвуют.
+  const markedCategories = CATEGORIES
+    .filter(c => allowed.has(c.id) && c.classes.length > 0)
+    .map(c => c.id);
+
   const lines = [
     HEADER_MARK,
+    `${VERSION_MARK} ${POLICY_VERSION}`,
+    `${CATEGORIES_MARK} ${markedCategories.join(',')}`,
     '# Управляется утилитой redos (/usb-policy). Не редактируйте вручную:',
     '# при следующем применении политики файл будет перезаписан.',
     `# Сгенерировано: ${new Date().toISOString()}`,
@@ -895,17 +920,14 @@ export function generateDaemonConf(current: string): string {
  * запрещённой, хотя в правилах она разрешена. Источник истины — сам файл.
  */
 export function readAppliedPolicy(): PolicyInput | null {
-  const text = readFile(RULES_FILE);
+  return parseAppliedPolicy(readFile(RULES_FILE));
+}
+
+/** Разбор rules.conf. Отделён от чтения файла, чтобы поддаваться проверке. */
+export function parseAppliedPolicy(text: string | null): PolicyInput | null {
   if (!text || !text.includes(HEADER_MARK)) return null;
 
-  const classes = text.match(/^allow\s+with-interface\s+match-all\s*\{([^}]*)\}/m)?.[1] ?? '';
-  const allowedClasses = new Set(
-    classes.trim().split(/\s+/).filter(Boolean).map(c => c.split(':')[0].toLowerCase()));
-
-  const allowed = CATEGORIES
-    .filter(c => c.classes.length > 0 &&
-                 c.classes.every(p => allowedClasses.has(p.split(':')[0].toLowerCase())))
-    .map(c => c.id);
+  const allowed = readMarkedCategories(text) ?? guessCategoriesByClasses(text);
 
   const trusted: TrustedDevice[] = [];
   const lines = text.split('\n');
@@ -927,6 +949,80 @@ export function readAppliedPolicy(): PolicyInput | null {
     });
   }
   return { allowed, trusted };
+}
+
+/** Категории из маркера. null, если маркера нет — файл старого формата. */
+function readMarkedCategories(text: string): CategoryId[] | null {
+  const line = text.split('\n').find(l => l.startsWith(CATEGORIES_MARK));
+  if (line === undefined) return null;
+  const known = new Set<string>(CATEGORIES.map(c => c.id));
+  return line.slice(CATEGORIES_MARK.length).split(',')
+             .map(v => v.trim())
+             .filter(v => known.has(v)) as CategoryId[];
+}
+
+/**
+ * Восстановление категорий по классам в правиле match-all — для файлов,
+ * записанных версиями до появления маркера. Категория считается разрешённой,
+ * только если разрешены все её классы.
+ */
+function guessCategoriesByClasses(text: string): CategoryId[] {
+  const classes = text.match(/^allow\s+with-interface\s+match-all\s*\{([^}]*)\}/m)?.[1] ?? '';
+  const allowedClasses = new Set(
+    classes.trim().split(/\s+/).filter(Boolean).map(c => c.split(':')[0].toLowerCase()));
+
+  return CATEGORIES
+    .filter(c => c.classes.length > 0 &&
+                 c.classes.every(p => allowedClasses.has(p.split(':')[0].toLowerCase())))
+    .map(c => c.id);
+}
+
+// ─── проверка политики ───────────────────────────────────────────────────────
+
+// USBGuard отдаёт хеш в base64 («jEP/6WzviqdJ…=»), но встречается и hex.
+// Проверка нужна не для криптографии, а чтобы в правило не попала строка с
+// кавычками или переводом строки, ломающая разбор файла демоном.
+const HASH_RE      = /^[A-Za-z0-9+/=]{32,128}$/;
+const DEVICE_ID_RE = /^[0-9a-f]{4}:[0-9a-f]{4}$/i;
+
+/**
+ * Проверяет политику до записи файла.
+ *
+ * Смысл в том, чтобы неверные данные останавливались здесь, а не превращались
+ * в правило, которое usbguard либо не поймёт (демон не стартует, машина
+ * остаётся без политики), либо поймёт слишком широко.
+ */
+export function validatePolicyInput(input: PolicyInput): string[] {
+  const errors: string[] = [];
+  const known = new Set<string>(CATEGORIES.map(c => c.id));
+
+  for (const id of input.allowed) {
+    if (!known.has(id)) errors.push(`неизвестная категория: ${id}`);
+  }
+
+  const seenHashes = new Set<string>();
+  input.trusted.forEach((t, i) => {
+    const label = t.name || t.deviceId || `исключение ${i + 1}`;
+    if (!t.deviceId && !t.serial && !t.hash) {
+      errors.push(`${label}: нечего разрешать — нет ни идентификатора, ни серийного номера, ни хеша`);
+    }
+    if (t.deviceId && !DEVICE_ID_RE.test(t.deviceId)) {
+      errors.push(`${label}: идентификатор должен быть вида 24a9:205a, получено «${t.deviceId}»`);
+    }
+    if (t.hash && !HASH_RE.test(t.hash)) {
+      errors.push(`${label}: хеш непохож на хеш USBGuard`);
+    }
+    if (t.hash) {
+      const h = t.hash.toLowerCase();
+      if (seenHashes.has(h)) errors.push(`${label}: такой хеш уже разрешён выше`);
+      seenHashes.add(h);
+    }
+    if (t.serial.length > 512 || t.name.length > 512) {
+      errors.push(`${label}: слишком длинное поле`);
+    }
+  });
+
+  return errors;
 }
 
 // ─── применение ──────────────────────────────────────────────────────────────
@@ -960,6 +1056,13 @@ export async function applyPolicy(
 ): Promise<ApplyResult> {
   const status = await readStatus();
   if (!status.installed) return { ok: false, msg: 'usbguard не установлен' };
+
+  // Неверные данные останавливаем до записи: файл с ошибкой демон не примет,
+  // и машина осталась бы вообще без политики.
+  const errors = validatePolicyInput(input);
+  if (errors.length) {
+    return { ok: false, msg: ['Политика не применена:', ...errors].join('\n') };
+  }
 
   // 0. Что разрешено сейчас — чтобы потом сравнить
   const before = await listDevices();
@@ -1024,12 +1127,29 @@ export async function applyPolicy(
   // Отката конфигурации нет: вместо него точечная страховка. Если устройство
   // ввода вдруг оказалось заблокировано, разблокируем его сразу — иначе
   // администратор останется без клавиатуры и не сможет ничего исправить.
+  //
+  // «Заблокировано» и «пропало из списка» — разные случаи, и второй опаснее:
+  // устройства, которого usbguard больше не видит, командой allow-device не
+  // вернуть, а без клавиатуры администратор не исправит уже ничего. Для него
+  // остаётся прямой путь — вернуть авторизацию через sysfs по номеру порта.
   const lost = inputBefore.filter(b => !after.some(a => a.hash === b.hash && a.target === 'allow'));
+  const unrecovered: string[] = [];
   for (const b of lost) {
     const now = after.find(a => a.hash === b.hash);
-    if (!now) continue;
-    onStep(`Возвращаю доступ устройству ввода: ${describeDevice(now)}`);
-    sudoRun(['usbguard', 'allow-device', '-p', String(now.id)]);
+    if (now) {
+      onStep(`Возвращаю доступ устройству ввода: ${describeDevice(now)}`);
+      const r = sudoRun(['usbguard', 'allow-device', '-p', String(now.id)]);
+      if (!r.ok) unrecovered.push(`${describeDevice(b)}: ${r.msg}`);
+      continue;
+    }
+    // Номер порта подставляется в путь, поэтому проверяем его форму: «2-1.4».
+    if (!/^\d+-[\d.]+$/.test(b.viaPort)) {
+      unrecovered.push(`${describeDevice(b)}: устройство исчезло из списка usbguard, порт неизвестен`);
+      continue;
+    }
+    onStep(`Устройство ввода исчезло из списка — возвращаю авторизацию через sysfs: ${describeDevice(b)}`);
+    const w = writeSudo(`/sys/bus/usb/devices/${b.viaPort}/authorized`, '1');
+    if (!w.ok) unrecovered.push(`${describeDevice(b)}: ${w.msg}`);
   }
   if (lost.length > 0) {
     await new Promise<void>(r => setTimeout(r, 500));
@@ -1044,6 +1164,12 @@ export async function applyPolicy(
     .map(c => c.title.toLowerCase());
 
   const lines = ['Политика применена'];
+  if (unrecovered.length) {
+    lines.push('ВНИМАНИЕ: не удалось вернуть доступ устройствам ввода:',
+               ...unrecovered.map(u => `  ${u}`),
+               'Если клавиатура перестала работать, снимите политику с другой машины ' +
+               'или загрузитесь и выполните: systemctl stop usbguard');
+  }
   if (!en.ok) {
     lines.push('ВНИМАНИЕ: автозапуск usbguard включить не удалось — после ' +
                'перезагрузки политика действовать не будет.',
