@@ -363,13 +363,12 @@ export function USBPolicyScreen({ onExit }: Props) {
 
       <Box paddingLeft={2} marginTop={1}>
         <Text color="cyan" bold>── Что политика заблокирует ──</Text>
-        <Text color="gray" dimColor>  Space — разрешить; неотмеченные будут заблокированы</Text>
+        <Text color="gray" dimColor>  Space — переключить: [✓] разрешить · [✗] заблокировать</Text>
       </Box>
       <Box paddingLeft={2}>
         <Text color="gray" dimColor>
           {/* ширины те же, что у строк ниже, иначе колонки разъедутся */}
-          {'  ' + 'разр'.padEnd(3) + ' было→станет   '.padEnd(16) +
-           'ид.'.padEnd(10) + ' ' + 'устройство'.padEnd(26) +
+          {'  ' + '    ' + 'ид.'.padEnd(10) + ' ' + 'устройство'.padEnd(26) +
            'тип'.padEnd(17) + 'размер ~'.padEnd(11) + 'узел'}
         </Text>
       </Box>
@@ -402,16 +401,10 @@ export function USBPolicyScreen({ onExit }: Props) {
         return (
           <Box key={keyOf(d) + i} paddingLeft={2}>
             <Text color={cur ? 'white' : 'gray'}>{cur ? '❯ ' : '  '}</Text>
-            <Text color={tr ? 'green' : 'gray'}>{tr ? '[✓]' : '[ ]'}</Text>
-            {/* Что станет после применения — главное; текущее состояние слева
-                для сравнения. Без этого зелёное «разрешено» в разделе про
-                блокировку читалось как обещание оставить устройство доступным. */}
-            <Text color="gray" dimColor>
-              {' ' + (offline ? '—' : d.target === 'allow' ? '✓' : '✗') + ' → '}
-            </Text>
-            <Text color={tr ? 'green' : 'red'} bold>
-              {(tr ? '✓ разрешить' : '✗ блокир.').padEnd(12)}
-            </Text>
+            {/* Флажок и есть решение: [✓] разрешить, [✗] заблокировать.
+                Отдельная колонка состояния только путала — зелёное
+                «разрешено» в разделе про блокировку читалось как обещание. */}
+            <Text color={tr ? 'green' : 'red'} bold>{tr ? '[✓] ' : '[✗] '}</Text>
             <Text color={cur ? 'white' : 'gray'} bold={cur}>
               {(d.deviceId || '—').padEnd(10)} {truncate(describeDevice(d), 25).padEnd(26)}
             </Text>
