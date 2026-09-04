@@ -864,9 +864,10 @@ export function readAppliedPolicy(): PolicyInput | null {
 // ─── применение ──────────────────────────────────────────────────────────────
 
 export interface ApplyResult extends FixResult {
-  /** Политика откачена из-за неудачной проверки. */
-  rolledBack?: boolean;
-  backupDir?:  string;
+  /** Сколько устройств заблокировано после применения. */
+  blocked?: number;
+  /** Всего устройств в системе. */
+  total?:   number;
 }
 
 /**
@@ -895,39 +896,23 @@ export async function applyPolicy(
   const before = await listDevices();
   const inputBefore = before.filter(d => d.categories.includes('input') && d.target === 'allow');
 
-  // 1. Бэкап
-  const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15);
-  const backupDir = `/root/redos-usbguard-backup-${stamp}`;
-  onStep(`Бэкап конфигурации в ${backupDir}`);
-  const mk = sudoRun(['mkdir', '-p', backupDir]);
-  if (!mk.ok) return { ok: false, msg: `не удалось создать ${backupDir}: ${mk.msg}` };
-  sudoRun(['cp', '-a', RULES_FILE, backupDir + '/']);
-  sudoRun(['cp', '-a', DAEMON_CONF, backupDir + '/']);
-
-  const restore = (): void => {
-    sudoRun(['cp', '-a', `${backupDir}/rules.conf`, RULES_FILE]);
-    sudoRun(['cp', '-a', `${backupDir}/usbguard-daemon.conf`, DAEMON_CONF]);
-    sudoRun(['systemctl', 'restart', status.serviceUnit]);
-  };
-
-  // 2. Запись
+  // 1. Запись
   onStep('Записываю правила и конфигурацию демона');
   const w1 = writeSudo(RULES_FILE, generateRules(input));
-  if (!w1.ok) return { ok: false, msg: `${RULES_FILE}: ${w1.msg}`, backupDir };
+  if (!w1.ok) return { ok: false, msg: `${RULES_FILE}: ${w1.msg}` };
   const w2 = writeSudo(DAEMON_CONF, generateDaemonConf(readFile(DAEMON_CONF) ?? ''));
-  if (!w2.ok) { restore(); return { ok: false, msg: `${DAEMON_CONF}: ${w2.msg}`, backupDir, rolledBack: true }; }
+  if (!w2.ok) return { ok: false, msg: `${DAEMON_CONF}: ${w2.msg}` };
   sudoRun(['chmod', '600', RULES_FILE]);
 
-  // 3. Запуск
+  // 2. Запуск
   onStep('Перезапускаю usbguard');
   sudoRun(['systemctl', 'enable', status.serviceUnit]);
   const rs = sudoRun(['systemctl', 'restart', status.serviceUnit]);
   if (!rs.ok) {
-    restore();
-    return { ok: false, msg: `демон не запустился: ${rs.msg}. Политика откачена.`, backupDir, rolledBack: true };
+    return { ok: false, msg: `демон не запустился: ${rs.msg}` };
   }
 
-  // 4. Ждём, пока демон поднимется и разберёт устройства.
+  // 3. Ждём, пока демон поднимется и разберёт устройства.
   // Фиксированная пауза здесь не годится: на холодном старте (первое
   // включение, служба ещё не была запущена) usbguard успевает ответить не
   // сразу, и проверка отрабатывала по пустому списку.
@@ -941,11 +926,10 @@ export async function applyPolicy(
     if (after.length > 0) break;
   }
   if (after.length === 0) {
-    restore();
-    return { ok: false, msg: 'usbguard не отдал список устройств за 10 секунд. Политика откачена.', backupDir, rolledBack: true };
+    return { ok: false, msg: 'usbguard не отдал список устройств за 10 секунд — проверьте systemctl status usbguard' };
   }
 
-  // 5. Приводим уже подключённые устройства в соответствие с политикой.
+  // 4. Приводим уже подключённые устройства в соответствие с политикой.
   // PresentDevicePolicy=apply-policy делает это при старте демона, но на
   // холодном старте часть устройств может остаться в прежнем состоянии —
   // тогда блокировка вступала в силу только со второго применения.
@@ -965,26 +949,34 @@ export async function applyPolicy(
   }
 
   onStep('Проверяю, что клавиатура и мышь остались доступны');
-  const lost = inputBefore.filter(b =>
-    !after.some(a => a.hash === b.hash && a.target === 'allow'));
+  // Отката конфигурации нет: вместо него точечная страховка. Если устройство
+  // ввода вдруг оказалось заблокировано, разблокируем его сразу — иначе
+  // администратор останется без клавиатуры и не сможет ничего исправить.
+  const lost = inputBefore.filter(b => !after.some(a => a.hash === b.hash && a.target === 'allow'));
+  for (const b of lost) {
+    const now = after.find(a => a.hash === b.hash);
+    if (!now) continue;
+    onStep(`Возвращаю доступ устройству ввода: ${describeDevice(now)}`);
+    sudoRun(['usbguard', 'allow-device', '-p', String(now.id)]);
+  }
   if (lost.length > 0) {
-    restore();
-    return {
-      ok: false,
-      rolledBack: true,
-      backupDir,
-      msg: `после применения оказались заблокированы устройства ввода (${lost.map(d => d.name || d.deviceId).join(', ')}). ` +
-           'Политика откачена — машина не осталась бы без клавиатуры.',
-    };
+    await new Promise<void>(r => setTimeout(r, 500));
+    after = await listDevices();
   }
 
   const blocked = after.filter(d => d.target !== 'allow').length;
-  return {
-    ok: true,
-    backupDir,
-    msg: `Политика применена: разрешено ${after.length - blocked} устройств, ` +
-         `заблокировано ${blocked}. Откат: ${backupDir}`,
-  };
+  const blockedTitles = SELECTABLE_CATEGORIES
+    .filter(c => !input.allowed.includes(c.id))
+    .map(c => c.title.toLowerCase());
+
+  const parts = [
+    blockedTitles.length ? `заблокированы категории: ${blockedTitles.join(', ')}`
+                         : 'ни одна категория не заблокирована',
+  ];
+  if (input.trusted.length) parts.push(`исключений: ${input.trusted.length}`);
+  parts.push(`устройств заблокировано ${blocked} из ${after.length}`);
+
+  return { ok: true, blocked, total: after.length, msg: 'Политика применена — ' + parts.join('; ') };
 }
 
 /** Снимает политику: демон останавливается, устройства снова доступны. */
