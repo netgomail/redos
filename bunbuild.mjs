@@ -23,7 +23,21 @@ console.log('\n  Building РедОС...\n');
 
 const result = await Bun.build({
   entrypoints: ['./src/app.tsx'],
-  compile: { outfile: OUTFILE, target: TARGET },
+  compile: {
+    outfile: OUTFILE,
+    target:  TARGET,
+    // Bun по умолчанию подхватывает .env и bunfig.toml из текущего каталога
+    // даже в скомпилированном бинарнике. redos запускают как `sudo redos`,
+    // поэтому любой каталог, доступный на запись обычному пользователю,
+    // становится вектором атаки: bunfig.toml с `preload` выполнит чужой код
+    // с правами root, а .env подменит переменные окружения.
+    // Утилите аудита безопасности ни то, ни другое не нужно — отключаем.
+    autoloadDotenv:      false,
+    autoloadBunfig:      false,
+    autoloadTsconfig:    false,
+    autoloadPackageJson: false,
+  },
+  minify: true,
   define: {
     'process.env.NODE_ENV': '"production"',
     'process.env.DEV':      '"false"',
