@@ -75,8 +75,6 @@ export interface Category {
   ids?:    string[];
   /** Нельзя выключить: без этого система развалится. */
   locked?: boolean;
-  /** Выключение опасно — требуется подтверждение. */
-  risky?:  boolean;
 }
 
 /**
@@ -95,14 +93,14 @@ export const CATEGORIES: Category[] = [
     hint: 'разветвители USB. Заблокировав их, вы отключите всё, что подключено через них' },
   { id: 'token',     title: 'Криптотокены (Рутокен)', classes: [], ids: TOKEN_VENDOR_IDS, locked: true,
     hint: 'Рутокен и Guardant — по производителю Актив: часть моделей объявляет себя HID или накопителем' },
-  { id: 'input',     title: 'Клавиатуры и мыши',    classes: ['03:*:*'], risky: true,
-    hint: 'класс HID. Сняв разрешение, вы потеряете управление машиной' },
+  { id: 'input',     title: 'Клавиатуры и мыши',    classes: ['03:*:*'], locked: true,
+    hint: 'класс HID: без них машиной не управлять, блокировать нечего' },
   { id: 'storage',   title: 'Накопители',           classes: ['08:*:*'],
     hint: 'флешки, внешние диски, картридеры, USB-приводы' },
-  { id: 'printer',   title: 'Принтеры',             classes: ['07:*:*'],
-    hint: 'принтеры и часть МФУ' },
-  { id: 'imaging',   title: 'Камеры и сканеры',     classes: ['06:*:*'],
-    hint: 'PTP/MTP: фотоаппараты, сканеры, телефоны' },
+  { id: 'printer',   title: 'Принтеры',             classes: ['07:*:*'], locked: true,
+    hint: 'принтеры и часть МФУ — рабочая необходимость' },
+  { id: 'imaging',   title: 'Сканеры и камеры',     classes: ['06:*:*'], locked: true,
+    hint: 'PTP/MTP: сканеры, фотоаппараты' },
   { id: 'video',     title: 'Веб-камеры',           classes: ['0e:*:*'],
     hint: 'в том числе встроенная камера ноутбука' },
   { id: 'audio',     title: 'Звук и гарнитуры',     classes: ['01:*:*'],
@@ -111,12 +109,21 @@ export const CATEGORIES: Category[] = [
     hint: 'USB-сетевые адаптеры, модемы, режим модема у телефона' },
   { id: 'wireless',  title: 'Bluetooth и радио',    classes: ['e0:*:*'],
     hint: 'в том числе встроенный Bluetooth' },
-  { id: 'smartcard', title: 'Смарт-карты и токены', classes: ['0b:*:*'],
-    hint: 'считыватели смарт-карт, часть USB-токенов' },
+  { id: 'smartcard', title: 'Смарт-карты и токены', classes: ['0b:*:*'], locked: true,
+    hint: 'считыватели смарт-карт и CCID-модели Рутокена' },
 ];
 
-/** Категории, которые всегда разрешены и не показываются переключателем. */
+/**
+ * Всегда разрешены и не показываются переключателем: блокировать их незачем,
+ * а возможность это сделать — только источник ошибок. Хабы держат всё дерево
+ * устройств, ввод — управление машиной, принтеры и сканеры нужны для работы,
+ * токены и смарт-карты — для входа и подписи. Каналом утечки ни один из них
+ * не является.
+ */
 export const LOCKED_CATEGORIES: CategoryId[] = CATEGORIES.filter(c => c.locked).map(c => c.id);
+
+/** Категории, которые администратор действительно выбирает. */
+export const SELECTABLE_CATEGORIES: Category[] = CATEGORIES.filter(c => !c.locked);
 
 /** Совпадает ли идентификатор устройства с шаблоном вида "0a89:*". */
 function idMatches(deviceId: string, pattern: string): boolean {

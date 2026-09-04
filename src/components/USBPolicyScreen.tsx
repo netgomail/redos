@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Box, Text, useInput, useStdout } from 'ink';
 import { Spinner } from './Spinner';
 import {
-  CATEGORIES,
+  CATEGORIES, SELECTABLE_CATEGORIES, LOCKED_CATEGORIES,
   readStatus, listDevices, install, applyPolicy, removePolicy, removeLegacyUdev,
 } from '../features/usbGuard';
 import type {
@@ -17,7 +17,6 @@ type Phase =
   | 'loading'
   | 'absent'    // usbguard не установлен
   | 'view'
-  | 'confirm'   // подтверждение опасного применения
   | 'running'
   | 'result';
 
@@ -34,12 +33,9 @@ export function USBPolicyScreen({ onExit }: Props) {
   const [status,  setStatus]  = useState<GuardStatus | null>(null);
   const [devices, setDevices] = useState<GuardDevice[]>([]);
 
-  // Разрешённые категории по умолчанию. Хабы и криптотокены разрешены
-  // принудительно (locked). Ввод — иначе машина останется без управления.
-  // Смарт-карты — там же живут CCID-модели Рутокена, а каналом утечки
-  // считыватель смарт-карт не является.
-  const [allowed, setAllowed] = useState<Set<CategoryId>>(
-    new Set(['hub', 'token', 'input', 'smartcard']));
+  // Выбираемые категории. Всегда разрешённые (LOCKED_CATEGORIES) сюда не
+  // попадают — их добавляет генератор правил.
+  const [allowed, setAllowed] = useState<Set<CategoryId>>(new Set());
   const [trusted, setTrusted] = useState<Set<string>>(new Set()); // ключ — hash или id:serial
 
   const [focus,     setFocus]     = useState<Focus>('categories');
@@ -68,12 +64,22 @@ export function USBPolicyScreen({ onExit }: Props) {
     // Восстанавливаем текущий выбор из того, что реально разрешено сейчас:
     // если политика уже наша, показываем её состояние, а не умолчания.
     if (st.managed) {
-      const live = new Set<CategoryId>(['hub']);
+      // Политика уже наша — показываем её состояние, а не умолчания
+      const live = new Set<CategoryId>();
       for (const d of devs) {
         if (d.target === 'allow') d.categories.forEach(c => live.add(c));
       }
-      setAllowed(live);
+      setAllowed(new Set([...live].filter(c => !LOCKED_CATEGORIES.includes(c))));
       setTrusted(new Set(devs.filter(d => d.target === 'allow' && d.uncategorized).map(keyOf)));
+    } else {
+      // Первое включение: отмечаем категории того, что подключено прямо сейчас,
+      // кроме накопителей. Так контроль не отключит используемую гарнитуру или
+      // сетевой адаптер, но флешки и картридеры заблокирует — ради чего всё и
+      // затевается.
+      const present = new Set<CategoryId>();
+      for (const d of devs) d.categories.forEach(c => present.add(c));
+      setAllowed(new Set([...present]
+        .filter(c => !LOCKED_CATEGORIES.includes(c) && c !== 'storage')));
     }
     setPhase('view');
   };
@@ -151,12 +157,7 @@ export function USBPolicyScreen({ onExit }: Props) {
 
   const runAction = (a: Action) => {
     switch (a.id) {
-      case 'apply':
-        // Отключение ввода — единственное, что может оставить машину без
-        // управления. Спрашиваем отдельно, остальное применяем сразу.
-        if (!allowed.has('input')) setPhase('confirm');
-        else doApply();
-        break;
+      case 'apply': doApply(); break;
       case 'legacy':  doLegacy(); break;
       case 'remove':  doRemove(); break;
       case 'refresh': refresh();  break;
@@ -178,12 +179,6 @@ export function USBPolicyScreen({ onExit }: Props) {
       return;
     }
 
-    if (phase === 'confirm') {
-      if (k('q') || key.escape) { setPhase('view'); return; }
-      if (k('d')) doApply();
-      return;
-    }
-
     // phase === 'view'
     if (k('q') || key.escape) { onExit(); return; }
     if (key.tab) {
@@ -195,10 +190,10 @@ export function USBPolicyScreen({ onExit }: Props) {
 
     if (focus === 'categories') {
       if (key.upArrow)   setCatIdx(i => Math.max(0, i - 1));
-      if (key.downArrow) setCatIdx(i => Math.min(CATEGORIES.length - 1, i + 1));
+      if (key.downArrow) setCatIdx(i => Math.min(SELECTABLE_CATEGORIES.length - 1, i + 1));
       if (char === ' ') {
-        const c = CATEGORIES[catIdx];
-        if (c.locked) return;
+        const c = SELECTABLE_CATEGORIES[catIdx];
+        if (!c) return;
         setAllowed(prev => {
           const next = new Set(prev);
           if (next.has(c.id)) next.delete(c.id); else next.add(c.id);
@@ -286,25 +281,6 @@ export function USBPolicyScreen({ onExit }: Props) {
     );
   }
 
-  if (phase === 'confirm') {
-    return (
-      <Frame width={width} subtitle="подтверждение">
-        <Box paddingLeft={3} marginBottom={1}>
-          <Text bold color="red">Категория «Клавиатуры и мыши» не разрешена</Text>
-        </Box>
-        <Box flexDirection="column" paddingLeft={3} marginBottom={1}>
-          <Text color="gray">USB-клавиатура и мышь после применения будут заблокированы.</Text>
-          <Text color="gray">Если других устройств ввода нет, вы потеряете управление машиной.</Text>
-          <Text> </Text>
-          <Text color="gray">Утилита проверит состояние после применения и откатит политику,</Text>
-          <Text color="gray">если ввод пропадёт, — но полагаться на это как на единственную</Text>
-          <Text color="gray">защиту не стоит.</Text>
-        </Box>
-        <Box paddingLeft={2}><Text color="gray" dimColor>D — всё равно применить · Q/Esc — вернуться</Text></Box>
-      </Frame>
-    );
-  }
-
   // ── основной экран ──────────────────────────────────────────────────────────
 
   const st = status!;
@@ -326,32 +302,29 @@ export function USBPolicyScreen({ onExit }: Props) {
         </Box>
       )}
 
-      <Box paddingLeft={2}><Text color="cyan" bold>── Разрешённые категории ──</Text></Box>
+      <Box paddingLeft={2}><Text color="cyan" bold>── Категории устройств ──</Text></Box>
       <Box paddingLeft={3} marginBottom={1}>
-        <Text color="gray" dimColor>всё, что не разрешено, блокируется на уровне ядра</Text>
+        <Text color="gray" dimColor>
+          {'всегда разрешены: ' +
+            CATEGORIES.filter(c => c.locked).map(c => c.title.toLowerCase()).join(', ')}
+        </Text>
       </Box>
-      {CATEGORIES.map((c, i) => {
+      {SELECTABLE_CATEGORIES.map((c, i) => {
         const cur = focus === 'categories' && i === catIdx;
-        const on  = allowed.has(c.id) || !!c.locked;
+        const on  = allowed.has(c.id);
         return (
           <Box key={c.id} paddingLeft={2}>
             <Text color={cur ? 'white' : 'gray'}>{cur ? '❯ ' : '  '}</Text>
-            <Text color={c.locked ? 'gray' : on ? 'green' : 'red'}>
-              {c.locked ? '[✓]' : on ? '[✓]' : '[ ]'}
-            </Text>
-            <Text color={cur ? 'white' : 'gray'} bold={cur}> {c.title.padEnd(22)}</Text>
-            <Text color={c.risky && !on ? 'red' : 'gray'} dimColor={!c.risky}>
-              {truncate(c.locked ? 'всегда разрешены — ' + c.hint : c.hint, Math.max(10, width - 34))}
-            </Text>
+            <Text color={on ? 'green' : 'red'}>{on ? '[✓] разрешены ' : '[ ] блокируются'}</Text>
+            <Text color={cur ? 'white' : 'gray'} bold={cur}> {c.title.padEnd(20)}</Text>
+            <Text color="gray" dimColor>{truncate(c.hint, Math.max(10, width - 46))}</Text>
           </Box>
         );
       })}
 
       <Box paddingLeft={2} marginTop={1}><Text color="cyan" bold>── Подключённые устройства ──</Text></Box>
       <Box paddingLeft={3} marginBottom={1}>
-        <Text color="gray" dimColor>
-          Space — сделать доверенным. Красным помечены блочные узлы: такое устройство — канал утечки
-        </Text>
+        <Text color="gray" dimColor>Space — сделать доверенным</Text>
       </Box>
       {devices.length === 0 ? (
         <Box paddingLeft={3}>
