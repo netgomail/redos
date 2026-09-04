@@ -64,13 +64,18 @@ export const PRESETS: Preset[] = [
     id: 'basic',
     title: 'Базовая',
     hint:  'minlen=8, классов 3, смена раз в 90 дней',
-    pwquality: { minlen: 8,  minclass: 3, dcredit: 0, ucredit: 0, lcredit: 0, ocredit: 0, difok: 5, retry: 3 },
+    // difok=3: при смене пароля три символа должны отличаться от старого.
+    // Пятёрка здесь была перебором — она отсекает не только «увеличить цифру
+    // на конце», но и вполне осмысленные правки, а «Базовая» на то и базовая.
+    pwquality: { minlen: 8,  minclass: 3, dcredit: 0, ucredit: 0, lcredit: 0, ocredit: 0, difok: 3, retry: 3 },
     login:     { PASS_MAX_DAYS: 90, PASS_MIN_DAYS: 1, PASS_WARN_AGE: 7 },
   },
   {
     id: 'strong',
     title: 'Усиленная',
     hint:  'minlen=10, классов 4, смена раз в 60 дней',
+    // difok=5: приём «увеличить цифру на конце» не пройдёт — это и есть смысл
+    // усиленной политики.
     pwquality: { minlen: 10, minclass: 4, dcredit: 0, ucredit: 0, lcredit: 0, ocredit: 0, difok: 5, retry: 3 },
     login:     { PASS_MAX_DAYS: 60, PASS_MIN_DAYS: 1, PASS_WARN_AGE: 14 },
   },
