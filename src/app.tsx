@@ -5,6 +5,7 @@ import { WelcomeTips }     from './components/WelcomeTips';
 import { InputBox }        from './components/InputBox';
 import { PasswordPolicyScreen } from './components/PasswordPolicyScreen';
 import { USBPolicyScreen } from './components/USBPolicyScreen';
+import { PrinterScreen }   from './components/PrinterScreen';
 import {
   UserMessage,
   SystemMessage, ErrorMessage,
@@ -149,6 +150,9 @@ function App({ autoCmd, initialError }: AppProps) {
   }
   if (screen === 'usb-policy') {
     return <USBPolicyScreen onExit={() => setScreen('chat')} />;
+  }
+  if (screen === 'printer') {
+    return <PrinterScreen onExit={() => setScreen('chat')} />;
   }
 
   // ── Основной чат-интерфейс ─────────────────────────────────────────────────

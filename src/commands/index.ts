@@ -17,6 +17,7 @@ export const COMMANDS: CommandDef[] = [
   { name: '/help',          description: 'показать список команд', showInTips: true },
   { name: '/inventory',     description: 'инвентаризация системы', usage: '/inventory [файл.txt]', showInTips: true },
   { name: '/passwd-policy', description: 'парольная политика — сложность и срок смены', showInTips: true },
+  { name: '/printer',       description: 'печать и сканирование — лечение очереди, только один МФУ', showInTips: true },
   { name: '/usb-policy',    description: 'блокировка USB-накопителей и список доверенных', showInTips: true },
   { name: '/quit',          description: 'завершить работу' },
 ];
@@ -110,6 +111,12 @@ async function handlePasswdPolicy(add: AddFn, openScreen: (s: Screen) => void, e
   openScreen('passwd-policy');
 }
 
+async function handlePrinter(add: AddFn, openScreen: (s: Screen) => void, exit: () => void) {
+  if (!linuxOnly(add, 'Печать и сканирование')) return;
+  if (!await requireRoot(add, exit, 'Печать и сканирование', '/printer')) return;
+  openScreen('printer');
+}
+
 async function handleUsbPolicy(add: AddFn, openScreen: (s: Screen) => void, exit: () => void) {
   if (!linuxOnly(add, 'Политика USB')) return;
   if (!await requireRoot(add, exit, 'Политика USB', '/usb-policy')) return;
@@ -132,6 +139,7 @@ export function useCommands(
       case '/help':          handleHelp(add); break;
       case '/inventory':     handleInventory(add, arg); break;
       case '/passwd-policy': handlePasswdPolicy(add, openScreen, exit); break;
+      case '/printer':       handlePrinter(add, openScreen, exit); break;
       case '/usb-policy':    handleUsbPolicy(add, openScreen, exit); break;
       default:               add('error', 'Неизвестная команда: ' + cmd + '  (введите /help)');
     }
