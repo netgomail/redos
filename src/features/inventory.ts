@@ -1,6 +1,7 @@
 import { existsSync } from 'fs';
 import { cpus, totalmem, freemem, networkInterfaces, hostname } from 'os';
 import { readFile } from '../utils/fs';
+import { joinScsiName } from '../utils/scsi';
 
 export interface InventorySection {
   title: string;
@@ -207,7 +208,10 @@ function sectionStorageMedia(): InventorySection {
     const tran        = (d.tran || '').toLowerCase();
     const kind        = classifyDisk(d);
     const sizeStr     = d.size > 0 ? fmtBytes(d.size) : '— (носитель не вставлен)';
-    const model       = [d.vendor?.trim(), d.model?.trim()].filter(Boolean).join(' ') || '—';
+    // Производителя и модель нельзя просто соединить пробелом: lsblk отдаёт
+    // производителя с добивкой до 8 байт, а модель уже нормализованной, и
+    // получается «SPCC Sol SPCC Solid State Disk» или «ATA KINGSTON ...».
+    const model       = joinScsiName(d.vendor, d.model) || '—';
     const driveSerial = (d.serial || '').trim();
     let   usbSerial   = '';
     let   usbId       = '';

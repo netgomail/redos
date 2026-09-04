@@ -26,6 +26,7 @@
 import { readdirSync, realpathSync, existsSync } from 'fs';
 import { dirname, join } from 'path';
 import { readFile } from '../utils/fs';
+import { joinScsiName } from '../utils/scsi';
 import { sudoRun, writeSudo } from '../utils/sudo';
 import type { FixResult } from '../utils/sudo';
 import { runPty, runPtyLines } from '../utils/terminal';
@@ -485,25 +486,6 @@ export interface UsbStorageNode {
 }
 
 const sysRead = (p: string): string => (readFile(p) ?? '').trim();
-
-/**
- * Склеивает производителя и модель из SCSI INQUIRY.
- *
- * Поля там фиксированной ширины: 8 байт под производителя и 16 под модель.
- * Производители иногда пишут одно название через границу: у внешнего SSD на
- * этой машине vendor="SPCC Sol", model="id State Disk" — это «SPCC Solid State
- * Disk», разрезанный посередине слова. Признак — поле производителя заполнено
- * целиком (8 символов без добивки), а модель начинается со строчной буквы.
- * Иначе поля просто соединяются пробелом: "KDI-MSFT" + "Windows 10".
- */
-function joinScsiName(rawVendor: string, rawModel: string): string {
-  const v = rawVendor.replace(/\s+$/, '');
-  const m = rawModel.trim();
-  if (!v) return m;
-  if (!m) return v;
-  const continues = rawVendor.length >= 8 && v.length === 8 && /^\p{Ll}/u.test(m);
-  return continues ? v + m : `${v} ${m}`;
-}
 
 /** Блочные узлы, поднятые через USB, с привязкой к каталогу usb_device. */
 function usbBlockNodes(): Map<string, UsbStorageNode[]> {
