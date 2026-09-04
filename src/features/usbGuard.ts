@@ -926,22 +926,45 @@ export async function applyPolicy(
     restore();
     return { ok: false, msg: `демон не запустился: ${rs.msg}. Политика откачена.`, backupDir, rolledBack: true };
   }
-  await new Promise<void>(r => setTimeout(r, 1500));
 
-  // 4. Проверка
-  onStep('Проверяю, что клавиатура и мышь остались доступны');
-  const active = await runPtyLines(['systemctl', 'is-active', status.serviceUnit],
-                                   { env: C_LOCALE, timeoutMs: 8000 });
-  if (!active.some(l => l.trim() === 'active')) {
-    restore();
-    return { ok: false, msg: 'демон не удержался запущенным. Политика откачена.', backupDir, rolledBack: true };
+  // 4. Ждём, пока демон поднимется и разберёт устройства.
+  // Фиксированная пауза здесь не годится: на холодном старте (первое
+  // включение, служба ещё не была запущена) usbguard успевает ответить не
+  // сразу, и проверка отрабатывала по пустому списку.
+  let after: GuardDevice[] = [];
+  for (let i = 0; i < 20; i++) {
+    await new Promise<void>(r => setTimeout(r, 500));
+    const active = await runPtyLines(['systemctl', 'is-active', status.serviceUnit],
+                                     { env: C_LOCALE, timeoutMs: 8000 });
+    if (!active.some(l => l.trim() === 'active')) continue;
+    after = await listDevices();
+    if (after.length > 0) break;
   }
-
-  const after = await listDevices();
   if (after.length === 0) {
     restore();
-    return { ok: false, msg: 'usbguard не отдал список устройств. Политика откачена.', backupDir, rolledBack: true };
+    return { ok: false, msg: 'usbguard не отдал список устройств за 10 секунд. Политика откачена.', backupDir, rolledBack: true };
   }
+
+  // 5. Приводим уже подключённые устройства в соответствие с политикой.
+  // PresentDevicePolicy=apply-policy делает это при старте демона, но на
+  // холодном старте часть устройств может остаться в прежнем состоянии —
+  // тогда блокировка вступала в силу только со второго применения.
+  const trustedKeys = new Set(input.trusted.map(t => t.hash || `${t.deviceId}:${t.serial}`));
+  const allowedSet = new Set(input.allowed);
+  let enforced = 0;
+  for (const d of after) {
+    const shouldAllow = allowedByCategories(d, allowedSet) ||
+                        trustedKeys.has(d.hash || `${d.deviceId}:${d.serial}`);
+    if (shouldAllow || d.target !== 'allow') continue;
+    onStep(`Применяю блокировку к ${describeDevice(d)}`);
+    if (sudoRun(['usbguard', 'block-device', String(d.id)]).ok) enforced++;
+  }
+  if (enforced > 0) {
+    await new Promise<void>(r => setTimeout(r, 500));
+    after = await listDevices();
+  }
+
+  onStep('Проверяю, что клавиатура и мышь остались доступны');
   const lost = inputBefore.filter(b =>
     !after.some(a => a.hash === b.hash && a.target === 'allow'));
   if (lost.length > 0) {
@@ -959,7 +982,8 @@ export async function applyPolicy(
   return {
     ok: true,
     backupDir,
-    msg: `Политика применена: разрешено ${after.length - blocked} устройств, заблокировано ${blocked}. Откат: ${backupDir}`,
+    msg: `Политика применена: разрешено ${after.length - blocked} устройств, ` +
+         `заблокировано ${blocked}. Откат: ${backupDir}`,
   };
 }
 
