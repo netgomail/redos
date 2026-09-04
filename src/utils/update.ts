@@ -1,7 +1,7 @@
 import { basename } from 'path';
 import { version as VERSION } from '../../package.json';
 
-const REPO = 'netgomail/redos';
+export const REPO = 'netgomail/redos';
 
 export function getPlatformBinary(): string {
   if (process.platform === 'darwin')

@@ -13,7 +13,8 @@ import {
 import { useMessages }    from './hooks/useMessages';
 import { useInputState }  from './hooks/useInputState';
 import { useCommands }    from './commands/index';
-import { selfUpdate }     from './utils/update';
+import { selfUpdate, REPO } from './utils/update';
+import { version as VERSION } from '../package.json';
 import { setRestartHandler } from './utils/restart';
 import type { Screen } from './types';
 
@@ -185,10 +186,12 @@ if (process.argv[2] === 'update') {
   const red   = `${ESC}[91m`;
   const gray  = `${ESC}[90m`;
 
-  // Прогресс-бар c фиолетово-оранжевым акцентом — под общую палитру.
+  // Прогресс-бар. Ровно тот же, что рисует install.sh при первой установке:
+  // ширина 22, заполненная часть зелёная, пустая серая. floor, а не round, —
+  // иначе бар выглядит полным ещё до конца загрузки (и расходится с install.sh).
   const bar = (received: number, total: number, width = 22): string => {
     if (total <= 0) return '';
-    const filled = Math.round((received / total) * width);
+    const filled = Math.min(width, Math.floor((received / total) * width));
     return `${dim}[${reset}${green}${'█'.repeat(filled)}${gray}${'░'.repeat(width - filled)}${dim}]${reset}`;
   };
 
@@ -198,96 +201,14 @@ if (process.argv[2] === 'update') {
         `${gray}v$1${reset} ${cyan}→${reset} ${green}${bold}v$2${reset}`)
     : s.replace(/v(\d+\.\d+\.\d+)/g, `${green}${bold}v$1${reset}`);
 
-  // Большой заголовок «РЕДОС» — пиксельные буквы из block-символов, высотой 6 строк.
-  // Каждая буква в массиве из 6 строк одинаковой ширины.
-  const FONT: Record<string, string[]> = {
-    'Р': [
-      '██████ ',
-      '██   ██',
-      '██   ██',
-      '██████ ',
-      '██     ',
-      '██     ',
-    ],
-    'Е': [
-      '██████ ',
-      '██     ',
-      '█████  ',
-      '██     ',
-      '██     ',
-      '██████ ',
-    ],
-    'Д': [
-      ' █████ ',
-      '██  ██ ',
-      '██  ██ ',
-      '██  ██ ',
-      '███████',
-      '█    █ ',
-    ],
-    'О': [
-      ' ████  ',
-      '██  ██ ',
-      '██  ██ ',
-      '██  ██ ',
-      '██  ██ ',
-      ' ████  ',
-    ],
-    'С': [
-      ' █████ ',
-      '██     ',
-      '██     ',
-      '██     ',
-      '██     ',
-      ' █████ ',
-    ],
-  };
-
-  // Линейный градиент фиолетовый → оранжевый по горизонтали.
-  const gradAt = (x: number, total: number): string => {
-    const t = total <= 1 ? 0 : x / (total - 1);
-    const r = Math.round(155 + (255 - 155) * t);
-    const g = Math.round( 60 + (150 -  60) * t);
-    const b = Math.round(220 + ( 30 - 220) * t);
-    return `${ESC}[38;2;${r};${g};${b}m`;
-  };
-
-  const renderBigTitle = (text: string): string[] => {
-    const chars = [...text];
-    const glyphs = chars.map(c => FONT[c] ?? ['', '', '', '', '', '']);
-    const h = 6;
-    const sep = '  ';
-    const rows: string[] = [];
-    // итоговая визуальная ширина для расчёта градиента
-    const widths = glyphs.map(g => g[0].length);
-    const totalW = widths.reduce((a, b) => a + b, 0) + sep.length * (chars.length - 1);
-    for (let row = 0; row < h; row++) {
-      let line = '';
-      let xCursor = 0;
-      for (let i = 0; i < chars.length; i++) {
-        const g = glyphs[i][row] ?? '';
-        for (let k = 0; k < g.length; k++) {
-          const ch = g[k];
-          if (ch === ' ') line += ' ';
-          else line += gradAt(xCursor + k, totalW) + bold + ch;
-        }
-        line += reset;
-        xCursor += g.length;
-        if (i < chars.length - 1) {
-          line += sep;
-          xCursor += sep.length;
-        }
-      }
-      rows.push(line);
-    }
-    return rows;
-  };
-
   // ── Заголовок ─────────────────────────────────────────────────────────────
+  // Тот же вид, что у install.sh при первой установке: рамка, имя, версия, ссылка.
+  const headerLine = '+' + '-'.repeat(50) + '+';
   process.stdout.write('\n');
-  for (const row of renderBigTitle('РЕДОС')) {
-    process.stdout.write('  ' + row + '\n');
-  }
+  process.stdout.write(`  ${cyan}${headerLine}${reset}\n`);
+  process.stdout.write(`  ${cyan}|${reset}  ${bold}РедОС${reset} Updater  ${gray}v${VERSION}${reset}\n`);
+  process.stdout.write(`  ${cyan}|${reset}  ${gray}https://github.com/${REPO}${reset}\n`);
+  process.stdout.write(`  ${cyan}${headerLine}${reset}\n`);
   process.stdout.write('\n');
 
   // ── Шаги и прогресс ───────────────────────────────────────────────────────
