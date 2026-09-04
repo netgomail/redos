@@ -363,14 +363,14 @@ export function USBPolicyScreen({ onExit }: Props) {
       })}
 
       <Box paddingLeft={2} marginTop={1}>
-        <Text color="cyan" bold>── Что политика заблокирует ──</Text>
-        <Text color="gray" dimColor>  Space — переключить: [✓] разрешить · [✗] заблокировать</Text>
+        <Text color="cyan" bold>── Исключения: разрешить устройство поимённо ──</Text>
+        <Text color="gray" dimColor>  Space — разрешить. Блокировка задаётся категориями выше</Text>
       </Box>
       <Box paddingLeft={2}>
         <Text color="gray" dimColor>
           {/* ширины те же, что у строк ниже, иначе колонки разъедутся */}
-          {'  ' + '    ' + 'ид.'.padEnd(10) + ' ' + 'устройство'.padEnd(26) +
-           'тип'.padEnd(17) + 'размер ~'.padEnd(11) + 'узел'}
+          {'  ' + '    ' + 'статус'.padEnd(11) + 'ид.'.padEnd(10) + ' ' +
+           'устройство'.padEnd(26) + 'тип'.padEnd(17) + 'размер ~'.padEnd(11) + 'узел'}
         </Text>
       </Box>
       {managedDevices.length === 0 ? (
@@ -402,10 +402,14 @@ export function USBPolicyScreen({ onExit }: Props) {
         return (
           <Box key={keyOf(d) + i} paddingLeft={2}>
             <Text color={cur ? 'white' : 'gray'}>{cur ? '❯ ' : '  '}</Text>
-            {/* Флажок и есть решение: [✓] разрешить, [✗] заблокировать.
-                Отдельная колонка состояния только путала — зелёное
-                «разрешено» в разделе про блокировку читалось как обещание. */}
-            <Text color={tr ? 'green' : 'red'} bold>{tr ? '[✓] ' : '[✗] '}</Text>
+            {/* Здесь устройства только разрешают: блокировка задаётся
+                категориями выше. Поэтому неотмеченное — просто пустой флажок,
+                без красного креста: оно не «запрещено этим списком», а всего
+                лишь не внесено в исключения. */}
+            <Text color={tr ? 'green' : 'gray'} bold={tr}>{tr ? '[✓] ' : '[ ] '}</Text>
+            <Text color={tr ? 'green' : 'gray'} dimColor={!tr}>
+              {(tr ? 'разрешено' : '').padEnd(11)}
+            </Text>
             <Text color={cur ? 'white' : 'gray'} bold={cur}>
               {(d.deviceId || '—').padEnd(10)} {truncate(describeDevice(d), 25).padEnd(26)}
             </Text>
@@ -445,7 +449,7 @@ export function USBPolicyScreen({ onExit }: Props) {
       <Box paddingLeft={2} marginTop={1}>
         <Text color="gray" dimColor>
           {focus === 'categories' ? '↑↓ выбор · Space разрешить/запретить · Tab к устройствам · Q выход'
-           : focus === 'devices'  ? '↑↓ выбор · Space доверенное · Tab к действиям · Q выход'
+           : focus === 'devices'  ? '↑↓ выбор · Space разрешить устройство · Tab к действиям · Q выход'
            :                        '↑↓ выбор · Enter выполнить · Tab к категориям · Q выход'}
         </Text>
       </Box>
