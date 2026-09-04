@@ -742,9 +742,12 @@ export function generateRules(input: PolicyInput): string {
     '',
     '# ── Разрешённые категории ───────────────────────────────────────────────',
     '# match-all: устройство проходит, только если ВСЕ его интерфейсы входят',
-    '# в разрешённый набор. Разрешено: ' +
-      CATEGORIES.filter(c => allowed.has(c.id) && c.classes.length)
-                .map(c => c.title.toLowerCase()).join(', '),
+    '# в разрешённый набор. Заблокированного здесь нет: оно не упоминается',
+    '# в правилах вовсе и отсекается неявной политикой в конце файла.',
+    '#',
+    // Перечень разрешённого переносим по строкам: файл читают глазами
+    ...wrapComment(CATEGORIES.filter(c => allowed.has(c.id) && c.classes.length)
+                             .map(c => c.title.toLowerCase()).join(', '), 'Разрешено: '),
     `allow with-interface match-all { ${classes.join(' ')} }`,
   ];
 
@@ -770,6 +773,18 @@ export function generateRules(input: PolicyInput): string {
     '',
   );
   return lines.join('\n');
+}
+
+/** Разбивает длинный перечень на строки-комментарии по ширине 72 символа. */
+function wrapComment(text: string, prefix: string): string[] {
+  const out: string[] = [];
+  let line = prefix;
+  for (const word of text.split(' ')) {
+    if (line.length + word.length + 3 > 72) { out.push('# ' + line.trimEnd()); line = '  '; }
+    line += word + ' ';
+  }
+  if (line.trim()) out.push('# ' + line.trimEnd());
+  return out;
 }
 
 function escapeQ(s: string): string {
