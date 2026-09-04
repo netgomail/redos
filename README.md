@@ -33,6 +33,14 @@ bun start
 
 ---
 
+## Тесты
+
+```bash
+bun test        # проверки политики контроля устройств
+```
+
+---
+
 ## Сборка бинарника
 
 ```bash
@@ -221,6 +229,7 @@ redos/
 │   │   ├── inventory.ts     — инвентаризация системы
 │   │   ├── passwordPolicy.ts — чтение/запись парольной политики, chage
 │   │   ├── usbGuard.ts      — контроль устройств через USBGuard
+│   │   ├── usbGuard.test.ts — проверки политики (bun test)
 │   │   └── printer.ts       — CUPS, SANE, обнаружение МФУ
 │   └── utils/
 │       ├── update.ts        — само-обновление
