@@ -23,6 +23,8 @@
  * администратор выбирал «накопители», а не набор шестнадцатеричных кодов.
  */
 
+import { readdirSync, realpathSync, existsSync } from 'fs';
+import { dirname, join } from 'path';
 import { readFile } from '../utils/fs';
 import { sudoRun, writeSudo } from '../utils/sudo';
 import type { FixResult } from '../utils/sudo';
@@ -37,8 +39,28 @@ const C_LOCALE = { LC_ALL: 'C', LANG: 'C', LANGUAGE: 'C' };
 // ─── категории устройств ─────────────────────────────────────────────────────
 
 export type CategoryId =
-  | 'hub' | 'input' | 'storage' | 'printer' | 'imaging'
+  | 'hub' | 'token' | 'input' | 'storage' | 'printer' | 'imaging'
   | 'video' | 'audio' | 'network' | 'wireless' | 'smartcard';
+
+/**
+ * Криптотокены «Актив» (Рутокен, Guardant) — производитель 0a89.
+ *
+ * Опознаются по производителю, а не по классу интерфейса, и это принципиально:
+ * класс у них не отражает назначение. По системной базе /usr/share/hwdata/usb.ids:
+ *
+ *   0a89:0020  Rutoken S            — вендорский класс, драйвер ifd-rutokens
+ *   0a89:0025  Rutoken lite
+ *   0a89:0026  Rutoken lite HID     — объявляет себя устройством ВВОДА
+ *   0a89:002a  Rutoken Mass Storage — объявляет себя НАКОПИТЕЛЕМ
+ *   0a89:0030  Rutoken ECP
+ *   0a89:0040  Rutoken ECP HID      — тоже ввод
+ *   0a89:0060  Rutoken Magistra
+ *   0a89:0080  Rutoken PinPad Ex
+ *
+ * То есть запрет категории «накопители» отрубил бы Rutoken Mass Storage, а с
+ * ним вход по токену и подпись. Поэтому весь производитель разрешён всегда.
+ */
+export const TOKEN_VENDOR_IDS = ['0a89:*'];
 
 export interface Category {
   id:      CategoryId;
@@ -46,6 +68,11 @@ export interface Category {
   hint:    string;
   /** Классы интерфейсов USB в формате with-interface. */
   classes: string[];
+  /**
+   * Опознание по идентификатору производителя, а не по классу интерфейса.
+   * Нужно для устройств, чей класс не отражает их назначение, — см. токены.
+   */
+  ids?:    string[];
   /** Нельзя выключить: без этого система развалится. */
   locked?: boolean;
   /** Выключение опасно — требуется подтверждение. */
@@ -66,6 +93,8 @@ export interface Category {
 export const CATEGORIES: Category[] = [
   { id: 'hub',       title: 'Хабы и контроллеры',   classes: ['09:*:*'], locked: true,
     hint: 'разветвители USB. Заблокировав их, вы отключите всё, что подключено через них' },
+  { id: 'token',     title: 'Криптотокены (Рутокен)', classes: [], ids: TOKEN_VENDOR_IDS, locked: true,
+    hint: 'Рутокен и Guardant — по производителю Актив: часть моделей объявляет себя HID или накопителем' },
   { id: 'input',     title: 'Клавиатуры и мыши',    classes: ['03:*:*'], risky: true,
     hint: 'класс HID. Сняв разрешение, вы потеряете управление машиной' },
   { id: 'storage',   title: 'Накопители',           classes: ['08:*:*'],
@@ -89,14 +118,29 @@ export const CATEGORIES: Category[] = [
 /** Категории, которые всегда разрешены и не показываются переключателем. */
 export const LOCKED_CATEGORIES: CategoryId[] = CATEGORIES.filter(c => c.locked).map(c => c.id);
 
-/** Классы, которые не относятся ни к одной категории (ff — вендорский и т.п.). */
-export function categoriesOfInterfaces(interfaces: string[]): CategoryId[] {
+/** Совпадает ли идентификатор устройства с шаблоном вида "0a89:*". */
+function idMatches(deviceId: string, pattern: string): boolean {
+  const [pv, pp] = pattern.toLowerCase().split(':');
+  const [dv, dp] = deviceId.toLowerCase().split(':');
+  if (!dv || !dp) return false;
+  return (pv === '*' || pv === dv) && (pp === '*' || pp === dp);
+}
+
+/**
+ * К каким категориям относится устройство. Учитываются и классы интерфейсов,
+ * и идентификатор: у токенов класс не отражает назначение, поэтому они
+ * опознаются по производителю.
+ *
+ * Пустой результат означает, что устройство не покрыто ни одной категорией
+ * (вендорский класс ff и подобные) — такое разрешается только поимённо.
+ */
+export function categoriesOf(interfaces: string[], deviceId = ''): CategoryId[] {
   const out = new Set<CategoryId>();
-  for (const iface of interfaces) {
-    const cls = iface.split(':')[0]?.toLowerCase();
-    if (!cls) continue;
-    for (const c of CATEGORIES) {
-      if (c.classes.some(p => p.split(':')[0].toLowerCase() === cls)) out.add(c.id);
+  for (const c of CATEGORIES) {
+    if (c.ids?.some(p => idMatches(deviceId, p))) { out.add(c.id); continue; }
+    for (const iface of interfaces) {
+      const cls = iface.split(':')[0]?.toLowerCase();
+      if (cls && c.classes.some(p => p.split(':')[0].toLowerCase() === cls)) { out.add(c.id); break; }
     }
   }
   return [...out];
@@ -211,6 +255,12 @@ export interface GuardDevice {
   categories: CategoryId[];
   /** Ни один класс интерфейса не попал в известные категории. */
   uncategorized: boolean;
+  /**
+   * Блочные устройства, которые даёт этот аппарат (sda, sdc...). Заполняется
+   * из /sys/block, а не из класса интерфейса: картридер с вендорским классом
+   * — такой же канал утечки, как флешка, и это должно быть видно.
+   */
+  storageNodes?: string[];
 }
 
 /**
@@ -233,11 +283,12 @@ export function parseDeviceLine(line: string): GuardDevice | null {
                   ?? '';
   const interfaces = ifaceBlock.trim().split(/\s+/).filter(Boolean);
 
-  const categories = categoriesOfInterfaces(interfaces);
+  const deviceId = rest.match(/\bid\s+([0-9a-fA-F*]{4}:[0-9a-fA-F*]{4})/)?.[1] ?? '';
+  const categories = categoriesOf(interfaces, deviceId);
   return {
     id:       parseInt(m[1], 10),
     target:   m[2] as GuardDevice['target'],
-    deviceId: rest.match(/\bid\s+([0-9a-fA-F*]{4}:[0-9a-fA-F*]{4})/)?.[1] ?? '',
+    deviceId,
     name:     str('name'),
     serial:   str('serial'),
     hash:     str('hash'),
@@ -248,9 +299,64 @@ export function parseDeviceLine(line: string): GuardDevice | null {
   };
 }
 
+/**
+ * USB-устройства, которые реально дают блочный узел.
+ *
+ * Класс интерфейса — не гарантия: встроенный картридер Realtek объявляет
+ * ff:06:50 (вендорский), но даёт /dev/sda, то есть является таким же каналом
+ * утечки, как флешка. Поэтому «накопитель ли это» определяется не по классу,
+ * а по факту наличия /sys/block/*, поднятого через USB.
+ */
+export function listUsbStorage(): UsbStorageNode[] {
+  const out: UsbStorageNode[] = [];
+  let names: string[];
+  try { names = readdirSync('/sys/block'); } catch { return out; }
+
+  for (const name of names) {
+    let real: string;
+    try { real = realpathSync(`/sys/block/${name}`); } catch { continue; }
+    if (!/\/usb\d+\//.test(real)) continue;
+
+    // Поднимаемся до ближайшего предка с idVendor — это и есть usb_device
+    let dir = real;
+    while (dir !== '/' && !existsSync(join(dir, 'idVendor'))) dir = dirname(dir);
+    if (dir === '/') continue;
+
+    const read = (f: string) => (readFile(join(dir, f)) ?? '').trim();
+    out.push({
+      block:    name,
+      sysPath:  dir,
+      deviceId: `${read('idVendor')}:${read('idProduct')}`,
+      serial:   read('serial'),
+      size:     (readFile(`/sys/block/${name}/size`) ?? '0').trim(),
+    });
+  }
+  return out;
+}
+
+export interface UsbStorageNode {
+  block:    string;   // sda
+  sysPath:  string;   // /sys/bus/usb/devices/1-12
+  deviceId: string;   // 0bda:0129
+  serial:   string;
+  size:     string;   // в секторах по 512 байт; 0 — носитель не вставлен
+}
+
 export async function listDevices(): Promise<GuardDevice[]> {
   const lines = await runPtyLines(['usbguard', 'list-devices'], { env: C_LOCALE, timeoutMs: 20_000 });
-  return lines.map(parseDeviceLine).filter((d): d is GuardDevice => d !== null);
+  const devices = lines.map(parseDeviceLine).filter((d): d is GuardDevice => d !== null);
+
+  // Отмечаем те, что дают блочный узел, — независимо от класса интерфейса
+  const storage = listUsbStorage();
+  for (const d of devices) {
+    const nodes = storage.filter(s =>
+      s.deviceId.toLowerCase() === d.deviceId.toLowerCase() &&
+      (!d.serial || !s.serial || s.serial === d.serial));
+    if (nodes.length > 0) {
+      d.storageNodes = nodes.map(n => n.block);
+    }
+  }
+  return devices;
 }
 
 // ─── установка ───────────────────────────────────────────────────────────────
@@ -312,7 +418,7 @@ export function generateRules(input: PolicyInput): string {
   const allowed = new Set<CategoryId>([...input.allowed, ...LOCKED_CATEGORIES]);
   const classes = CATEGORIES
     .filter(c => allowed.has(c.id))
-    .flatMap(c => c.classes);
+    .flatMap(c => c.classes);   // категории, опознаваемые по id, идут отдельным правилом
 
   const lines = [
     HEADER_MARK,
@@ -329,10 +435,23 @@ export function generateRules(input: PolicyInput): string {
     'reject with-interface all-of { 08:*:* e0:*:* }',
     'reject with-interface all-of { 08:*:* 02:*:* }',
     '',
+    '# ── Криптотокены ────────────────────────────────────────────────────────',
+    '# Разрешены всегда и опознаются по производителю, а не по классу:',
+    '# Rutoken Mass Storage объявляет себя накопителем, Rutoken ECP HID —',
+    '# устройством ввода, Rutoken S — вендорским классом. Запрет категории',
+    '# «накопители» иначе отрубил бы вход по токену и подпись.',
+    '#',
+    '# Правило стоит ПОСЛЕ reject-ов выше — намеренно: идентификатор',
+    '# производителя подделывается тривиально, и подложное устройство',
+    '# «Рутокен + клавиатура» должно быть отклонено, а не разрешено.',
+    ...CATEGORIES.filter(c => c.locked && c.ids?.length)
+                 .flatMap(c => (c.ids ?? []).map(id => `allow id ${id}`)),
+    '',
     '# ── Разрешённые категории ───────────────────────────────────────────────',
     '# match-all: устройство проходит, только если ВСЕ его интерфейсы входят',
     '# в разрешённый набор. Разрешено: ' +
-      CATEGORIES.filter(c => allowed.has(c.id)).map(c => c.title.toLowerCase()).join(', '),
+      CATEGORIES.filter(c => allowed.has(c.id) && c.classes.length)
+                .map(c => c.title.toLowerCase()).join(', '),
     `allow with-interface match-all { ${classes.join(' ')} }`,
   ];
 
