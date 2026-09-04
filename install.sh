@@ -21,19 +21,25 @@ fail()    { echo -e "  ${RED}${BOLD}\u2717${NC} $*" >&2; exit 1; }
 
 # ── Прогресс-бар (тот же, что рисует `redos update`) ──────────────────────────
 BAR_W=22
+BAR_DRAWN=0
 mb()      { awk -v b="${1:-0}" 'BEGIN { printf "%.1f", b / 1048576 }'; }
+# Бар перерисовывается на своей строке, но курсор оставляем на пустой строке под
+# ней: иначе в конце загрузки бар оказывается прижат к нижнему краю терминала.
+# Отсюда \033[1A перед каждой перерисовкой, кроме первой.
 draw_bar() {
-  local recv=$1 total=$2 filled=0 pct=0 f='' e=''
+  local recv=$1 total=$2 filled=0 pct=0 f='' e='' up=''
   if [ "$total" -gt 0 ]; then
     filled=$(( recv * BAR_W / total ))
     pct=$(( recv * 100 / total ))
     [ "$filled" -gt "$BAR_W" ] && filled=$BAR_W
     [ "$pct" -gt 100 ] && pct=100
   fi
-  [ "$filled" -gt 0 ]              && f=$(printf '\u2588%.0s' $(seq 1 "$filled"))
-  [ "$filled" -lt "$BAR_W" ]       && e=$(printf '\u2591%.0s' $(seq 1 $(( BAR_W - filled ))))
-  printf "\r  ${CYAN}\u203a${NC} Скачиваю ${DIM}[${NC}${GREEN}%s${GRAY}%s${DIM}]${NC} ${BOLD}%3d%%${NC} ${DIM}(%s / %s MB)${NC}   " \
+  [ "$filled" -gt 0 ]        && f=$(printf '\u2588%.0s' $(seq 1 "$filled"))
+  [ "$filled" -lt "$BAR_W" ] && e=$(printf '\u2591%.0s' $(seq 1 $(( BAR_W - filled ))))
+  [ "$BAR_DRAWN" -eq 1 ]     && up='\033[1A'
+  printf "${up}\r  ${CYAN}\u203a${NC} Скачиваю ${DIM}[${NC}${GREEN}%s${GRAY}%s${DIM}]${NC} ${BOLD}%3d%%${NC} ${DIM}(%s / %s MB)${NC}\033[K\n" \
          "$f" "$e" "$pct" "$(mb "$recv")" "$(mb "$total")"
+  BAR_DRAWN=1
 }
 
 # ── Проверка платформы ───────────────────────────────────────────────────────
@@ -81,11 +87,10 @@ if [ "${TOTAL:-0}" -gt 0 ]; then
     sleep 0.2
   done
   if ! wait "$CURL_PID"; then
-    echo ""
     fail "Не удалось скачать: $DOWNLOAD_URL"
   fi
   draw_bar "$TOTAL" "$TOTAL"
-  echo ""
+  # курсор уже стоит на пустой строке под баром — хватит одного перевода
   echo ""
 else
   # Размер неизвестен — показываем штатный бар curl, без него было бы молчание

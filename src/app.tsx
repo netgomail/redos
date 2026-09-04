@@ -215,9 +215,9 @@ if (process.argv[2] === 'update') {
   let progressActive = false;
   const finishProgressLine = () => {
     if (progressActive) {
-      // \n закрывает строку прогресса (поверх неё писали через \r),
-      // второй \n добавляет пустую строку, чтобы следующий шаг не прилипал.
-      process.stdout.write('\n\n');
+      // Курсор уже стоит на пустой строке под баром (см. progress ниже),
+      // поэтому достаточно одного перевода, чтобы следующий шаг не прилипал.
+      process.stdout.write('\n');
       progressActive = false;
     }
   };
@@ -231,7 +231,11 @@ if (process.argv[2] === 'update') {
     const text = total > 0
       ? `Скачиваю ${bar(received, total)} ${bold}${pct.toString().padStart(3)}%${reset} ${dim}(${mb(received)} / ${mb(total)} MB)${reset}`
       : `Скачиваю ${mb(received)} MB`;
-    process.stdout.write(`\r  ${cyan}›${reset} ${text}   `);
+    // Бар живёт на своей строке, но курсор оставляем на пустой строке под ней:
+    // иначе к концу загрузки бар оказывается прижат к нижнему краю терминала.
+    // Отсюда «курсор вверх» перед каждой перерисовкой, кроме первой.
+    const up = progressActive ? `${ESC}[1A` : '';
+    process.stdout.write(`${up}\r  ${cyan}›${reset} ${text}${ESC}[K\n`);
     progressActive = true;
   };
 
