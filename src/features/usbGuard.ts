@@ -863,12 +863,7 @@ export function readAppliedPolicy(): PolicyInput | null {
 
 // ─── применение ──────────────────────────────────────────────────────────────
 
-export interface ApplyResult extends FixResult {
-  /** Сколько устройств заблокировано после применения. */
-  blocked?: number;
-  /** Всего устройств в системе. */
-  total?:   number;
-}
+export interface ApplyResult extends FixResult {}
 
 /**
  * Применяет политику с сеткой безопасности.
@@ -964,19 +959,22 @@ export async function applyPolicy(
     after = await listDevices();
   }
 
-  const blocked = after.filter(d => d.target !== 'allow').length;
+  // Итог описывает решение администратора: какие категории он закрыл и какие
+  // устройства разрешил поимённо. Пересчёт заблокированных устройств здесь
+  // неуместен — устройства политикой не блокируют, их блокирует категория.
   const blockedTitles = SELECTABLE_CATEGORIES
     .filter(c => !input.allowed.includes(c.id))
     .map(c => c.title.toLowerCase());
 
-  const parts = [
-    blockedTitles.length ? `заблокированы категории: ${blockedTitles.join(', ')}`
-                         : 'ни одна категория не заблокирована',
-  ];
-  if (input.trusted.length) parts.push(`исключений: ${input.trusted.length}`);
-  parts.push(`устройств заблокировано ${blocked} из ${after.length}`);
+  const lines = ['Политика применена'];
+  lines.push(blockedTitles.length
+    ? `Заблокированы категории: ${blockedTitles.join(', ')}`
+    : 'Заблокированных категорий нет — разрешено всё');
+  if (input.trusted.length) {
+    lines.push(`Разрешены устройства: ${input.trusted.map(t => t.name || t.deviceId).join(', ')}`);
+  }
 
-  return { ok: true, blocked, total: after.length, msg: 'Политика применена — ' + parts.join('; ') };
+  return { ok: true, msg: lines.join('\n') };
 }
 
 /** Снимает политику: демон останавливается, устройства снова доступны. */

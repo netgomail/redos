@@ -169,7 +169,7 @@ export function USBPolicyScreen({ onExit }: Props) {
   const doApply = async () => {
     startRun('Применение политики');
     const r = await applyPolicy({ allowed: [...allowed], trusted: buildTrusted() }, step);
-    finish(r.ok, 'Контроль устройств', [r.msg]);
+    finish(r.ok, 'Контроль устройств', r.msg.split('\n'));
   };
 
   const doRemove = async () => {
