@@ -368,9 +368,9 @@ export function USBPolicyScreen({ onExit }: Props) {
       <Box paddingLeft={2}>
         <Text color="gray" dimColor>
           {/* ширины те же, что у строк ниже, иначе колонки разъедутся */}
-          {'  ' + 'разр'.padEnd(3) + ' сейчас     '.padEnd(13) +
+          {'  ' + 'разр'.padEnd(3) + ' было→станет   '.padEnd(16) +
            'ид.'.padEnd(10) + ' ' + 'устройство'.padEnd(26) +
-           'тип'.padEnd(19) + 'размер ~'.padEnd(11) + 'узел'}
+           'тип'.padEnd(17) + 'размер ~'.padEnd(11) + 'узел'}
         </Text>
       </Box>
       {managedDevices.length === 0 ? (
@@ -403,14 +403,20 @@ export function USBPolicyScreen({ onExit }: Props) {
           <Box key={keyOf(d) + i} paddingLeft={2}>
             <Text color={cur ? 'white' : 'gray'}>{cur ? '❯ ' : '  '}</Text>
             <Text color={tr ? 'green' : 'gray'}>{tr ? '[✓]' : '[ ]'}</Text>
-            <Text color={offline ? 'gray' : d.target === 'allow' ? 'green' : 'red'}>
-              {offline ? ' —           ' : d.target === 'allow' ? ' ✓ разрешено ' : ' ✗ заблокир. '}
+            {/* Что станет после применения — главное; текущее состояние слева
+                для сравнения. Без этого зелёное «разрешено» в разделе про
+                блокировку читалось как обещание оставить устройство доступным. */}
+            <Text color="gray" dimColor>
+              {' ' + (offline ? '—' : d.target === 'allow' ? '✓' : '✗') + ' → '}
+            </Text>
+            <Text color={tr ? 'green' : 'red'} bold>
+              {(tr ? '✓ разрешить' : '✗ блокир.').padEnd(12)}
             </Text>
             <Text color={cur ? 'white' : 'gray'} bold={cur}>
               {(d.deviceId || '—').padEnd(10)} {truncate(describeDevice(d), 25).padEnd(26)}
             </Text>
             <Text color={d.uncategorized ? 'yellow' : 'gray'} dimColor={!d.uncategorized}>
-              {truncate(kind, 18).padEnd(19)}
+              {truncate(kind, 16).padEnd(17)}
             </Text>
             <Text color={size.stale ? 'yellow' : 'gray'} dimColor={!size.stale}>
               {truncate(size.stale ? size.text + ' ~' : size.text, 10).padEnd(11)}
