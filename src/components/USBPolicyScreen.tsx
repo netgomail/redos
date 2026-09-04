@@ -43,11 +43,11 @@ export function USBPolicyScreen({ onExit }: Props) {
   const [allowed, setAllowed] = useState<Set<CategoryId>>(new Set());
   const [trusted, setTrusted] = useState<Set<string>>(new Set()); // ключ — hash или id:serial
   /**
-   * Сведения о доверенных устройствах, в том числе не подключённых сейчас.
-   * Без этого отмеченная ранее флешка, вынутая из порта, молча выпадала бы
-   * из политики при следующем применении.
+   * Поимённые разрешения из уже применённой политики. Нужны, чтобы показать
+   * их устройства в списке, даже если они сейчас не подключены: иначе
+   * исключение исчезло бы молча, а невидимого состояния у экрана быть не должно.
    */
-  const [trustedInfo, setTrustedInfo] = useState<Map<string, TrustedDevice>>(new Map());
+  const [appliedTrusted, setAppliedTrusted] = useState<TrustedDevice[]>([]);
 
   const [focus,     setFocus]     = useState<Focus>('categories');
   const [catIdx,    setCatIdx]    = useState(0);
@@ -67,7 +67,23 @@ export function USBPolicyScreen({ onExit }: Props) {
    * устройство показывать незачем: отметка «доверенное» для него ничего не
    * меняет, а строка сбивает с толку.
    */
-  const managedDevices = devices.filter(d => !allowedByCategories(d, allowed));
+  const connectedBlocked = devices.filter(d => !allowedByCategories(d, allowed));
+
+  /**
+   * Устройства из поимённых разрешений прошлой политики, которых сейчас нет в
+   * портах. Показываем их наравне с подключёнными, иначе исключение пропало бы
+   * незаметно для администратора.
+   */
+  const offlineTrusted: GuardDevice[] = appliedTrusted
+    .filter(t => !devices.some(d => keyOf(d) === (t.hash || `${t.deviceId}:${t.serial}`)))
+    .map(t => ({
+      id: -1, target: 'block' as const,
+      deviceId: t.deviceId, name: t.name, serial: t.serial, hash: t.hash,
+      viaPort: '', interfaces: [], categories: [], uncategorized: true,
+      offline: true,
+    } as GuardDevice & { offline: true }));
+
+  const managedDevices = [...connectedBlocked, ...offlineTrusted];
 
   const refresh = async () => {
     setPhase('loading');
@@ -88,20 +104,17 @@ export function USBPolicyScreen({ onExit }: Props) {
       // Читаем сами правила, а не список подключённых устройств: если веб-камера
       // сейчас не воткнута, категория всё равно разрешена, и галочка должна стоять.
       setAllowed(new Set(applied.allowed.filter(c => !LOCKED_CATEGORIES.includes(c))));
-      const info = new Map<string, TrustedDevice>();
-      for (const t of applied.trusted) info.set(t.hash || `${t.deviceId}:${t.serial}`, t);
-      for (const d of devs) {
-        const k = keyOf(d);
-        if (info.has(k)) info.set(k, { deviceId: d.deviceId, serial: d.serial, name: describeDevice(d), hash: d.hash });
-      }
-      setTrustedInfo(info);
-      setTrusted(new Set(info.keys()));
+      setAppliedTrusted(applied.trusted);
     } else {
       // Первое включение: разрешено всё. Администратор снимает отметки с того,
       // что нужно заблокировать, и только после этого применяет. Так включение
       // контроля само по себе ничего не ломает — блокировка всегда осознанная.
       setAllowed(new Set(SELECTABLE_CATEGORIES.map(c => c.id)));
+      setAppliedTrusted([]);
     }
+    // Отметки всегда с чистого листа: что видно на экране, то и будет
+    // применено. Скрытого состояния, перенесённого из прошлой политики, нет.
+    setTrusted(new Set());
     setPhase('view');
   };
 
@@ -139,16 +152,10 @@ export function USBPolicyScreen({ onExit }: Props) {
   };
 
   const buildTrusted = (): TrustedDevice[] => {
-    // Берём из накопленных сведений, а не только из подключённых сейчас:
-    // отмеченное ранее устройство не должно пропасть из политики оттого,
-    // что его вынули из порта.
-    const out: TrustedDevice[] = [];
-    for (const key of trusted) {
-      const d = devices.find(x => keyOf(x) === key);
-      if (d) { out.push({ deviceId: d.deviceId, serial: d.serial, name: describeDevice(d), hash: d.hash }); continue; }
-      const kept = trustedInfo.get(key);
-      if (kept) out.push(kept);
-    }
+    // Ровно то, что отмечено на экране, — ни больше, ни меньше
+    const out: TrustedDevice[] = managedDevices
+      .filter(d => trusted.has(keyOf(d)))
+      .map(d => ({ deviceId: d.deviceId, serial: d.serial, name: describeDevice(d), hash: d.hash }));
 
     // Устройства из старой udev-политики: хеша у них нет, опознаём по id+serial
     for (const a of status?.legacyUdev?.allowed ?? []) {
@@ -238,8 +245,6 @@ export function USBPolicyScreen({ onExit }: Props) {
         const d = managedDevices[devIdx];
         if (!d) return;
         const key2 = keyOf(d);
-        setTrustedInfo(prev => new Map(prev).set(key2,
-          { deviceId: d.deviceId, serial: d.serial, name: describeDevice(d), hash: d.hash }));
         setTrusted(prev => {
           const next = new Set(prev);
           if (next.has(key2)) next.delete(key2); else next.add(key2);
@@ -358,7 +363,7 @@ export function USBPolicyScreen({ onExit }: Props) {
 
       <Box paddingLeft={2} marginTop={1}>
         <Text color="cyan" bold>── Что политика заблокирует ──</Text>
-        <Text color="gray" dimColor>  Space — разрешить устройство поимённо</Text>
+        <Text color="gray" dimColor>  Space — разрешить; неотмеченные будут заблокированы</Text>
       </Box>
       <Box paddingLeft={2}>
         <Text color="gray" dimColor>
@@ -386,7 +391,9 @@ export function USBPolicyScreen({ onExit }: Props) {
         const tr  = trusted.has(keyOf(d));
         // Блочный узел важнее класса: картридер с вендорским классом — такой же
         // канал утечки, как флешка, и админ должен это видеть.
-        const nodes = d.storageNodes?.length ? d.storageNodes.map(n => '/dev/' + n).join(' ') : '—';
+        const offline = (d as GuardDevice & { offline?: boolean }).offline === true;
+        const nodes = offline ? 'не подключено'
+                    : d.storageNodes?.length ? d.storageNodes.map(n => '/dev/' + n).join(' ') : '—';
         const size  = describeSize(d);
         // Тип — как в инвентаризации: «USB-флешка», «USB-накопитель». Для
         // не-накопителей вместо типа показываем категорию, а для устройств
@@ -396,8 +403,8 @@ export function USBPolicyScreen({ onExit }: Props) {
           <Box key={keyOf(d) + i} paddingLeft={2}>
             <Text color={cur ? 'white' : 'gray'}>{cur ? '❯ ' : '  '}</Text>
             <Text color={tr ? 'green' : 'gray'}>{tr ? '[✓]' : '[ ]'}</Text>
-            <Text color={d.target === 'allow' ? 'green' : 'red'}>
-              {d.target === 'allow' ? ' ✓ разрешено ' : ' ✗ заблокир. '}
+            <Text color={offline ? 'gray' : d.target === 'allow' ? 'green' : 'red'}>
+              {offline ? ' —           ' : d.target === 'allow' ? ' ✓ разрешено ' : ' ✗ заблокир. '}
             </Text>
             <Text color={cur ? 'white' : 'gray'} bold={cur}>
               {(d.deviceId || '—').padEnd(10)} {truncate(describeDevice(d), 25).padEnd(26)}
@@ -408,7 +415,9 @@ export function USBPolicyScreen({ onExit }: Props) {
             <Text color={size.stale ? 'yellow' : 'gray'} dimColor={!size.stale}>
               {truncate(size.stale ? size.text + ' ~' : size.text, 10).padEnd(11)}
             </Text>
-            <Text color={nodes === '—' ? 'gray' : 'red'} dimColor={nodes === '—'}>{nodes}</Text>
+            <Text color={offline ? 'yellow' : nodes === '—' ? 'gray' : 'red'} dimColor={nodes === '—'}>
+              {nodes}
+            </Text>
           </Box>
         );
       })}
