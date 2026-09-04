@@ -4,6 +4,7 @@ import { Spinner } from './Spinner';
 import {
   CATEGORIES, SELECTABLE_CATEGORIES, LOCKED_CATEGORIES,
   readStatus, listDevices, install, applyPolicy, removePolicy, removeLegacyUdev,
+  readAppliedPolicy, describeDevice, describeInterfaces,
 } from '../features/usbGuard';
 import type {
   CategoryId, GuardStatus, GuardDevice, TrustedDevice,
@@ -63,14 +64,13 @@ export function USBPolicyScreen({ onExit }: Props) {
 
     // Восстанавливаем текущий выбор из того, что реально разрешено сейчас:
     // если политика уже наша, показываем её состояние, а не умолчания.
-    if (st.managed) {
-      // Политика уже наша — показываем её состояние, а не умолчания
-      const live = new Set<CategoryId>();
-      for (const d of devs) {
-        if (d.target === 'allow') d.categories.forEach(c => live.add(c));
-      }
-      setAllowed(new Set([...live].filter(c => !LOCKED_CATEGORIES.includes(c))));
-      setTrusted(new Set(devs.filter(d => d.target === 'allow' && d.uncategorized).map(keyOf)));
+    const applied = st.managed ? readAppliedPolicy() : null;
+    if (applied) {
+      // Читаем сами правила, а не список подключённых устройств: если веб-камера
+      // сейчас не воткнута, категория всё равно разрешена, и галочка должна стоять.
+      setAllowed(new Set(applied.allowed.filter(c => !LOCKED_CATEGORIES.includes(c))));
+      const keys = new Set(applied.trusted.map(t => t.hash || `${t.deviceId}:${t.serial}`));
+      setTrusted(new Set(devs.filter(d => keys.has(keyOf(d))).map(keyOf)));
     } else {
       // Первое включение: разрешено всё. Администратор снимает отметки с того,
       // что нужно заблокировать, и только после этого применяет. Так включение
@@ -319,8 +319,12 @@ export function USBPolicyScreen({ onExit }: Props) {
       })}
 
       <Box paddingLeft={2} marginTop={1}><Text color="cyan" bold>── Подключённые устройства ──</Text></Box>
-      <Box paddingLeft={3} marginBottom={1}>
-        <Text color="gray" dimColor>Space — сделать доверенным</Text>
+      <Box paddingLeft={2}>
+        <Text color="gray" dimColor>
+          {/* ширины те же, что у строк ниже, иначе колонки разъедутся */}
+          {'  ' + 'дов'.padEnd(3) + ' состояние  '.padEnd(13) +
+           'ид.'.padEnd(10) + ' ' + 'устройство'.padEnd(29) + 'категория'}
+        </Text>
       </Box>
       {devices.length === 0 ? (
         <Box paddingLeft={3}>
@@ -334,18 +338,20 @@ export function USBPolicyScreen({ onExit }: Props) {
         // Блочный узел важнее класса: картридер с вендорским классом — такой же
         // канал утечки, как флешка, и админ должен это видеть.
         const nodes = d.storageNodes?.length ? d.storageNodes.map(n => '/dev/' + n).join(' ') : '';
+        // «вне категорий» само по себе ничего не говорит — показываем классы
+        // интерфейсов словами, чтобы было понятно, что это за устройство.
         const cats = d.categories.length
           ? d.categories.map(c => CATEGORIES.find(x => x.id === c)?.title ?? c).join(', ')
-          : nodes ? 'накопитель, вендорский класс' : 'вне категорий';
+          : `вне категорий: ${describeInterfaces(d.interfaces) || 'интерфейсы неизвестны'}`;
         return (
           <Box key={keyOf(d) + i} paddingLeft={2}>
             <Text color={cur ? 'white' : 'gray'}>{cur ? '❯ ' : '  '}</Text>
             <Text color={tr ? 'green' : 'gray'}>{tr ? '[✓]' : '[ ]'}</Text>
             <Text color={d.target === 'allow' ? 'green' : 'red'}>
-              {d.target === 'allow' ? ' разрешено ' : ' заблок.   '}
+              {d.target === 'allow' ? ' ✓ разрешено ' : ' ✗ заблокир. '}
             </Text>
             <Text color={cur ? 'white' : 'gray'} bold={cur}>
-              {(d.deviceId || '—').padEnd(10)} {truncate(d.name || '(без имени)', 22).padEnd(22)}
+              {(d.deviceId || '—').padEnd(10)} {truncate(describeDevice(d), 29).padEnd(29)}
             </Text>
             <Text color={d.uncategorized ? 'yellow' : 'gray'} dimColor={!d.uncategorized}>
               {d.uncategorized ? '⚠ ' : ''}{truncate(cats, Math.max(8, width - 64))}

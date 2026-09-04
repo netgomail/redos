@@ -269,6 +269,86 @@ export async function readStatus(): Promise<GuardStatus> {
   return base;
 }
 
+// ─── имена устройств ─────────────────────────────────────────────────────────
+
+/**
+ * Человекочитаемые имена классов интерфейсов — чтобы «вне категорий» не было
+ * загадкой: администратор должен видеть, что перед ним, а не только код.
+ */
+const CLASS_NAMES: Record<string, string> = {
+  '00': 'на уровне интерфейсов', '01': 'аудио', '02': 'связь', '03': 'ввод',
+  '05': 'физический', '06': 'изображение', '07': 'принтер', '08': 'накопитель',
+  '09': 'хаб', '0a': 'данные связи', '0b': 'смарт-карта', '0d': 'защита контента',
+  '0e': 'видео', '0f': 'здоровье', '10': 'аудио/видео', '11': 'billboard',
+  '12': 'мост Type-C', 'dc': 'диагностика', 'e0': 'беспроводной',
+  'ef': 'разное', 'fe': 'специальный', 'ff': 'вендорский',
+};
+
+export function describeInterfaces(interfaces: string[]): string {
+  const names = new Set<string>();
+  for (const i of interfaces) {
+    const c = i.split(':')[0]?.toLowerCase();
+    if (c) names.add(`${c} — ${CLASS_NAMES[c] ?? 'неизвестный класс'}`);
+  }
+  return [...names].join(', ');
+}
+
+/**
+ * Имя устройства из системной базы /usr/share/hwdata/usb.ids.
+ *
+ * Нужно потому, что дескриптор часто пуст: флешка 24a9:205a на тестовой
+ * машине сообщает в iProduct одни пробелы, и usbguard показывает пустое имя.
+ * Формат базы: строка "vvvv  Название производителя", ниже строки с отступом
+ * табуляцией "pppp  Название модели".
+ */
+let usbIdsCache: Map<string, { vendor: string; products: Map<string, string> }> | null = null;
+
+function loadUsbIds(): Map<string, { vendor: string; products: Map<string, string> }> {
+  if (usbIdsCache) return usbIdsCache;
+  const map = new Map<string, { vendor: string; products: Map<string, string> }>();
+  const text = readFile('/usr/share/hwdata/usb.ids') ?? readFile('/usr/share/misc/usb.ids') ?? '';
+  let current: { vendor: string; products: Map<string, string> } | null = null;
+  for (const line of text.split('\n')) {
+    if (!line || line.startsWith('#')) continue;
+    const v = line.match(/^([0-9a-f]{4})\s+(.+)$/);
+    if (v) { current = { vendor: v[2].trim(), products: new Map() }; map.set(v[1], current); continue; }
+    const p = line.match(/^\t([0-9a-f]{4})\s+(.+)$/);
+    if (p && current) current.products.set(p[1], p[2].trim());
+    // Строки с двумя табуляциями — протоколы интерфейсов, они нам не нужны,
+    // как и секции после списка производителей (C 00, AT ...): их отсеет
+    // проверка на 4 hex-символа.
+  }
+  usbIdsCache = map;
+  return map;
+}
+
+/** «Realtek Semiconductor Corp. RTS5129 Card Reader Controller» или ''. */
+export function lookupUsbName(deviceId: string): string {
+  const [v, p] = (deviceId || '').toLowerCase().split(':');
+  if (!v || !p) return '';
+  const entry = loadUsbIds().get(v);
+  if (!entry) return '';
+  const product = entry.products.get(p);
+  return product ? `${entry.vendor} ${product}` : entry.vendor;
+}
+
+/**
+ * Как показать устройство человеку. Дескриптор бывает пустым или из пробелов,
+ * поэтому имя собирается по цепочке: дескриптор → системная база → серийный
+ * номер → блочный узел.
+ */
+export function describeDevice(d: GuardDevice): string {
+  const fromDescriptor = d.name.trim();
+  if (fromDescriptor) return fromDescriptor;
+
+  const fromDb = lookupUsbName(d.deviceId);
+  if (fromDb) return fromDb;
+
+  if (d.serial) return `без имени, S/N ${d.serial}`;
+  if (d.storageNodes?.length) return `без имени, /dev/${d.storageNodes[0]}`;
+  return 'без имени';
+}
+
 // ─── устройства ──────────────────────────────────────────────────────────────
 
 export interface GuardDevice {
@@ -547,6 +627,45 @@ export function generateDaemonConf(current: string): string {
     if (!seen.has(k)) out.push(`${k}=${v}`);
   }
   return out.join('\n').replace(/\n{3,}/g, '\n\n').trimEnd() + '\n';
+}
+
+/**
+ * Читает применённую политику обратно из rules.conf.
+ *
+ * Восстанавливать выбор по списку подключённых устройств нельзя: если ни одна
+ * веб-камера сейчас не воткнута, категория «веб-камеры» выглядела бы
+ * запрещённой, хотя в правилах она разрешена. Источник истины — сам файл.
+ */
+export function readAppliedPolicy(): PolicyInput | null {
+  const text = readFile(RULES_FILE);
+  if (!text || !text.includes(HEADER_MARK)) return null;
+
+  const classes = text.match(/^allow\s+with-interface\s+match-all\s*\{([^}]*)\}/m)?.[1] ?? '';
+  const allowedClasses = new Set(
+    classes.trim().split(/\s+/).filter(Boolean).map(c => c.split(':')[0].toLowerCase()));
+
+  const allowed = CATEGORIES
+    .filter(c => c.classes.length > 0 &&
+                 c.classes.every(p => allowedClasses.has(p.split(':')[0].toLowerCase())))
+    .map(c => c.id);
+
+  const trusted: TrustedDevice[] = [];
+  const lines = text.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    // Правила категорий и токенов пропускаем: нас интересуют поимённые
+    const m = l.match(/^allow\s+id\s+([0-9a-f]{4}:[0-9a-f]{4})\b(.*)$/i);
+    if (!m) continue;
+    const rest = m[2];
+    const prev = (lines[i - 1] ?? '').trim();
+    trusted.push({
+      deviceId: m[1],
+      serial:   rest.match(/\bserial\s+"((?:[^"\\]|\\.)*)"/)?.[1] ?? '',
+      hash:     rest.match(/\bhash\s+"((?:[^"\\]|\\.)*)"/)?.[1] ?? '',
+      name:     prev.startsWith('#') ? prev.replace(/^#\s*/, '') : '',
+    });
+  }
+  return { allowed, trusted };
 }
 
 // ─── применение ──────────────────────────────────────────────────────────────
