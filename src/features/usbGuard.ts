@@ -627,6 +627,25 @@ function saveRemembered(devices: GuardDevice[]): void {
   writeSudo(CACHE_FILE, JSON.stringify(cache, null, 2) + '\n');
 }
 
+/**
+ * Пропустит ли устройство политика при таком наборе разрешённых категорий.
+ *
+ * Повторяет семантику сгенерированных правил: match-all по классам плюс
+ * разрешение по идентификатору для категорий вроде криптотокенов. Нужна,
+ * чтобы показывать в списке только те устройства, судьбу которых
+ * администратор ещё должен решить.
+ */
+export function allowedByCategories(d: GuardDevice, allowed: Set<CategoryId>): boolean {
+  const active = CATEGORIES.filter(c => c.locked || allowed.has(c.id));
+
+  // Категории, опознаваемые по идентификатору (токены), — отдельным правилом
+  if (active.some(c => c.ids?.some(pat => idMatches(d.deviceId, pat)))) return true;
+
+  if (d.interfaces.length === 0) return false;
+  const classes = new Set(active.flatMap(c => c.classes).map(p => p.split(':')[0].toLowerCase()));
+  return d.interfaces.every(i => classes.has(i.split(':')[0].toLowerCase()));
+}
+
 // ─── установка ───────────────────────────────────────────────────────────────
 
 /** Ставит usbguard из репозитория. Пакет есть в штатном репозитории РЕД ОС. */
