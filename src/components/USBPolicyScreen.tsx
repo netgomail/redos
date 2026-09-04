@@ -72,14 +72,10 @@ export function USBPolicyScreen({ onExit }: Props) {
       setAllowed(new Set([...live].filter(c => !LOCKED_CATEGORIES.includes(c))));
       setTrusted(new Set(devs.filter(d => d.target === 'allow' && d.uncategorized).map(keyOf)));
     } else {
-      // Первое включение: отмечаем категории того, что подключено прямо сейчас,
-      // кроме накопителей. Так контроль не отключит используемую гарнитуру или
-      // сетевой адаптер, но флешки и картридеры заблокирует — ради чего всё и
-      // затевается.
-      const present = new Set<CategoryId>();
-      for (const d of devs) d.categories.forEach(c => present.add(c));
-      setAllowed(new Set([...present]
-        .filter(c => !LOCKED_CATEGORIES.includes(c) && c !== 'storage')));
+      // Первое включение: разрешено всё. Администратор снимает отметки с того,
+      // что нужно заблокировать, и только после этого применяет. Так включение
+      // контроля само по себе ничего не ломает — блокировка всегда осознанная.
+      setAllowed(new Set(SELECTABLE_CATEGORIES.map(c => c.id)));
     }
     setPhase('view');
   };
