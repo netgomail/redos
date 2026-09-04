@@ -46,22 +46,58 @@ export type CategoryId =
 /**
  * Криптотокены «Актив» (Рутокен, Guardant) — производитель 0a89.
  *
- * Опознаются по производителю, а не по классу интерфейса, и это принципиально:
- * класс у них не отражает назначение. По системной базе /usr/share/hwdata/usb.ids:
+ * Опознаются по идентификатору, а не по классу интерфейса, и это
+ * принципиально: класс у них не отражает назначение. Rutoken lite HID и
+ * Rutoken ECP HID объявляют себя устройствами ввода, Rutoken S — вендорским
+ * классом, Rutoken Mass Storage — накопителем. Запрет категории «накопители»
+ * иначе отрубил бы вход по токену и подпись.
  *
- *   0a89:0020  Rutoken S            — вендорский класс, драйвер ifd-rutokens
- *   0a89:0025  Rutoken lite
- *   0a89:0026  Rutoken lite HID     — объявляет себя устройством ВВОДА
- *   0a89:002a  Rutoken Mass Storage — объявляет себя НАКОПИТЕЛЕМ
- *   0a89:0030  Rutoken ECP
- *   0a89:0040  Rutoken ECP HID      — тоже ввод
- *   0a89:0060  Rutoken Magistra
- *   0a89:0080  Rutoken PinPad Ex
+ * Перечислены конкретные модели, а не весь производитель (было `0a89:*`).
+ * Причина в том, что идентификатор подделывается тривиально: с шаблоном на
+ * весь вендор достаточно было перепрошить VID обычной флешки, чтобы она
+ * прошла мимо заблокированной категории «накопители». Список выверен по
+ * системной базе /usr/share/hwdata/usb.ids (вендор 0a89, «Aktiv»).
  *
- * То есть запрет категории «накопители» отрубил бы Rutoken Mass Storage, а с
- * ним вход по токену и подпись. Поэтому весь производитель разрешён всегда.
+ * Модели, которых в списке нет, вносятся администратором поимённо — в
+ * исключения, по хешу дескриптора.
  */
-export const TOKEN_VENDOR_IDS = ['0a89:*'];
+export const TOKEN_DEVICE_IDS = [
+  '0a89:0001',  // Guardant Stealth/Net
+  '0a89:0002',  // Guardant ID
+  '0a89:0003',  // Guardant Stealth 2
+  '0a89:0004',  // Rutoken
+  '0a89:0005',  // Guardant Fidus
+  '0a89:0006',  // Guardant Stealth 3
+  '0a89:0007',  // Guardant Stealth 2
+  '0a89:0008',  // Guardant Stealth 3 Sign/Time
+  '0a89:0009',  // Guardant Code
+  '0a89:000a',  // Guardant Sign Pro
+  '0a89:000b',  // Guardant Sign Pro HID
+  '0a89:000c',  // Guardant Stealth 3 Sign/Time
+  '0a89:000d',  // Guardant Code HID
+  '0a89:000f',  // Guardant System Firmware Update
+  '0a89:0020',  // Rutoken S
+  '0a89:0025',  // Rutoken lite
+  '0a89:0026',  // Rutoken lite HID
+  '0a89:002a',  // Rutoken Mass Storage
+  '0a89:002b',  // Guardant Mass Storage
+  '0a89:0030',  // Rutoken ECP
+  '0a89:0040',  // Rutoken ECP HID
+  '0a89:0060',  // Rutoken Magistra
+  '0a89:0061',  // Rutoken Magistra
+  '0a89:0069',  // Reader
+  '0a89:0080',  // Rutoken PinPad Ex
+  '0a89:0081',  // Rutoken PinPad In
+  '0a89:0082',  // Rutoken PinPad 2
+];
+
+/**
+ * Класс интерфейса «накопитель». Устройство, которое его объявляет, не
+ * проходит по правилу токена, даже если совпал идентификатор: подделать VID
+ * и PID проще, чем что-либо ещё, а накопитель — тот самый канал утечки,
+ * ради которого всё и делается.
+ */
+const STORAGE_CLASS = '08';
 
 export interface Category {
   id:      CategoryId;
@@ -92,7 +128,7 @@ export interface Category {
 export const CATEGORIES: Category[] = [
   { id: 'hub',       title: 'Хабы и контроллеры',   classes: ['09:*:*'], locked: true,
     hint: 'разветвители USB. Заблокировав их, вы отключите всё, что подключено через них' },
-  { id: 'token',     title: 'Криптотокены (Рутокен)', classes: [], ids: TOKEN_VENDOR_IDS, locked: true,
+  { id: 'token',     title: 'Криптотокены (Рутокен)', classes: [], ids: TOKEN_DEVICE_IDS, locked: true,
     hint: 'Рутокен и Guardant — по производителю Актив: часть моделей объявляет себя HID или накопителем' },
   { id: 'input',     title: 'Клавиатуры и мыши',    classes: ['03:*:*'], locked: true,
     hint: 'класс HID: без них машиной не управлять, блокировать нечего' },
@@ -651,8 +687,11 @@ function saveRemembered(devices: GuardDevice[]): void {
 export function allowedByCategories(d: GuardDevice, allowed: Set<CategoryId>): boolean {
   const active = CATEGORIES.filter(c => c.locked || allowed.has(c.id));
 
-  // Категории, опознаваемые по идентификатору (токены), — отдельным правилом
-  if (active.some(c => c.ids?.some(pat => idMatches(d.deviceId, pat)))) return true;
+  // Категории, опознаваемые по идентификатору (токены), — отдельным правилом.
+  // Условие none-of { 08:*:* } из правил повторяем здесь: устройство с
+  // накопительным интерфейсом по идентификатору токена не проходит.
+  const isStorage = d.interfaces.some(i => i.split(':')[0].toLowerCase() === STORAGE_CLASS);
+  if (!isStorage && active.some(c => c.ids?.some(pat => idMatches(d.deviceId, pat)))) return true;
 
   if (d.interfaces.length === 0) return false;
   const classes = new Set(active.flatMap(c => c.classes).map(p => p.split(':')[0].toLowerCase()));
@@ -742,16 +781,25 @@ export function generateRules(input: PolicyInput): string {
     'reject with-interface all-of { 08:*:* 02:*:* }',
     '',
     '# ── Криптотокены ────────────────────────────────────────────────────────',
-    '# Разрешены всегда и опознаются по производителю, а не по классу:',
-    '# Rutoken Mass Storage объявляет себя накопителем, Rutoken ECP HID —',
-    '# устройством ввода, Rutoken S — вендорским классом. Запрет категории',
-    '# «накопители» иначе отрубил бы вход по токену и подпись.',
+    '# Разрешены всегда и опознаются по идентификатору, а не по классу:',
+    '# Rutoken ECP HID объявляет себя устройством ввода, Rutoken S —',
+    '# вендорским классом. Запрет категории «накопители» иначе отрубил бы',
+    '# вход по токену и подпись.',
     '#',
-    '# Правило стоит ПОСЛЕ reject-ов выше — намеренно: идентификатор',
-    '# производителя подделывается тривиально, и подложное устройство',
+    '# Модели перечислены поимённо, и к каждой добавлено условие',
+    '# none-of { 08:*:* }: идентификатор подделывается тривиально, а без',
+    '# этого условия достаточно было перепрошить VID обычной флешки, чтобы',
+    '# она прошла мимо заблокированной категории «накопители».',
+    '#',
+    '# Токен, который объявляет накопитель (Rutoken Mass Storage), под это',
+    '# правило не подпадает: он проходит по категории «накопители», а если',
+    '# она закрыта — вносится в исключения по хешу дескриптора.',
+    '#',
+    '# Правила стоят ПОСЛЕ reject-ов выше — намеренно: подложное устройство',
     '# «Рутокен + клавиатура» должно быть отклонено, а не разрешено.',
     ...CATEGORIES.filter(c => c.locked && c.ids?.length)
-                 .flatMap(c => (c.ids ?? []).map(id => `allow id ${id}`)),
+                 .flatMap(c => (c.ids ?? [])
+                   .map(id => `allow id ${id} with-interface none-of { ${STORAGE_CLASS}:*:* }`)),
     '',
     '# ── Разрешённые категории ───────────────────────────────────────────────',
     '# match-all: устройство проходит, только если ВСЕ его интерфейсы входят',
@@ -764,13 +812,17 @@ export function generateRules(input: PolicyInput): string {
     `allow with-interface match-all { ${classes.join(' ')} }`,
   ];
 
-  if (input.trusted.length > 0) {
+  if (input.trusted.some(t => t.deviceId || t.serial || t.hash)) {
     lines.push(
       '',
       '# ── Доверенные устройства ───────────────────────────────────────────────',
       '# Опознаются по хешу дескриптора: serial подделывается, хеш — нет.',
     );
     for (const t of input.trusted) {
+      // Устройство без единого признака дало бы строку «allow» — правило,
+      // разрешающее вообще всё и стоящее выше неявной блокировки. Такое
+      // исключение молча пропускаем: разрешать нечего.
+      if (!t.deviceId && !t.serial && !t.hash) continue;
       const parts: string[] = ['allow'];
       if (t.deviceId) parts.push(`id ${t.deviceId}`);
       if (t.serial)   parts.push(`serial "${escapeQ(t.serial)}"`);
@@ -859,9 +911,12 @@ export function readAppliedPolicy(): PolicyInput | null {
   const lines = text.split('\n');
   for (let i = 0; i < lines.length; i++) {
     const l = lines[i];
-    // Правила категорий и токенов пропускаем: нас интересуют поимённые
+    // Правила категорий и токенов пропускаем: нас интересуют поимённые.
+    // Токены теперь записаны конкретными идентификаторами и под регулярное
+    // выражение подходят — отсекаем их по списку моделей.
     const m = l.match(/^allow\s+id\s+([0-9a-f]{4}:[0-9a-f]{4})\b(.*)$/i);
     if (!m) continue;
+    if (TOKEN_DEVICE_IDS.includes(m[1].toLowerCase())) continue;
     const rest = m[2];
     const prev = (lines[i - 1] ?? '').trim();
     trusted.push({
@@ -882,16 +937,22 @@ export interface ApplyResult extends FixResult {}
  * Применяет политику с сеткой безопасности.
  *
  * Порядок такой, чтобы машина не осталась без клавиатуры:
- *  1. бэкап текущих конфигов;
- *  2. запись новых;
- *  3. перезапуск демона;
- *  4. ПРОВЕРКА: демон жив, правила загрузились, и все устройства ввода,
- *     которые были разрешены до применения, разрешены и после;
- *  5. если проверка не прошла — откат из бэкапа и перезапуск.
+ *  1. запоминаем, какие устройства ввода разрешены сейчас;
+ *  2. пишем rules.conf и usbguard-daemon.conf;
+ *  3. перезапускаем демона и ждём, пока он отдаст список устройств;
+ *  4. приводим уже подключённые устройства в соответствие с политикой;
+ *  5. ПРОВЕРКА: каждое устройство ввода, разрешённое до применения, разрешено
+ *     и после; потерявшим доступ возвращаем его точечно.
+ *
+ * Отката к прежней конфигурации здесь нет — намеренно, вместо него точечная
+ * страховка на шаге 5. Файлы отката жили в /etc, переживали перезагрузку и
+ * сами становились источником путаницы: администратор видел рядом с активной
+ * политикой её прошлую копию неизвестного возраста. Возврат к прежнему
+ * состоянию делается осознанно — командой «снять политику».
  *
  * Проверка на устройствах ввода заодно ловит и то, что версия usbguard не
  * поняла оператор match-all: тогда правило не загрузится, клавиатура окажется
- * заблокированной, и мы откатимся, а не оставим систему без управления.
+ * заблокированной, и доступ ей вернут здесь же.
  */
 export async function applyPolicy(
   input: PolicyInput,
@@ -914,7 +975,10 @@ export async function applyPolicy(
 
   // 2. Запуск
   onStep('Перезапускаю usbguard');
-  sudoRun(['systemctl', 'enable', status.serviceUnit]);
+  // Автозапуск и запуск — разные вещи, и провал автозапуска молчаливым быть не
+  // должен: без него политика действует до первой перезагрузки, а
+  // администратор видит «политика применена» и считает машину защищённой.
+  const en = sudoRun(['systemctl', 'enable', status.serviceUnit]);
   const rs = sudoRun(['systemctl', 'restart', status.serviceUnit]);
   if (!rs.ok) {
     return { ok: false, msg: `демон не запустился: ${rs.msg}` };
@@ -980,6 +1044,12 @@ export async function applyPolicy(
     .map(c => c.title.toLowerCase());
 
   const lines = ['Политика применена'];
+  if (!en.ok) {
+    lines.push('ВНИМАНИЕ: автозапуск usbguard включить не удалось — после ' +
+               'перезагрузки политика действовать не будет.',
+               `Причина: ${en.msg}`,
+               `Включите вручную: systemctl enable ${status.serviceUnit}`);
+  }
   lines.push(blockedTitles.length
     ? `Заблокированы категории: ${blockedTitles.join(', ')}`
     : 'Заблокированных категорий нет — разрешено всё');
