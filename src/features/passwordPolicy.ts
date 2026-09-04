@@ -13,7 +13,6 @@ import type { FixResult } from '../utils/sudo';
  * существующих.
  */
 
-export const PWQ_DROPIN_DIR  = '/etc/security/pwquality.conf.d';
 export const PWQ_DROPIN_FILE = '/etc/security/pwquality.conf.d/50-redos.conf';
 export const PWQ_BASE_FILE   = '/etc/security/pwquality.conf';
 export const LOGIN_DEFS_FILE = '/etc/login.defs';

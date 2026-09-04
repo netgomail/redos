@@ -566,11 +566,6 @@ export function listUsbSysfs(): UsbSysfsDevice[] {
   return out;
 }
 
-/** Осталось для совместимости: только устройства с блочными узлами. */
-export function listUsbStorage(): UsbSysfsDevice[] {
-  return listUsbSysfs().filter(d => d.storage.length > 0);
-}
-
 export async function listDevices(): Promise<GuardDevice[]> {
   const lines = await runPtyLines(['usbguard', 'list-devices'], { env: C_LOCALE, timeoutMs: 20_000 });
   const devices = lines.map(parseDeviceLine).filter((d): d is GuardDevice => d !== null);
