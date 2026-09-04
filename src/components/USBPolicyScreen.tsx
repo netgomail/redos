@@ -344,7 +344,7 @@ export function USBPolicyScreen({ onExit }: Props) {
       <Box paddingLeft={2}><Text color="cyan" bold>── Категории устройств ──</Text></Box>
       <Box paddingLeft={3} marginBottom={1}>
         <Text color="gray" dimColor>
-          {'всегда разрешены: ' +
+          {'Space — переключить: [✓] разрешить · [✗] заблокировать.  Всегда разрешены: ' +
             CATEGORIES.filter(c => c.locked).map(c => c.title.toLowerCase()).join(', ')}
         </Text>
       </Box>
@@ -354,9 +354,10 @@ export function USBPolicyScreen({ onExit }: Props) {
         return (
           <Box key={c.id} paddingLeft={2}>
             <Text color={cur ? 'white' : 'gray'}>{cur ? '❯ ' : '  '}</Text>
-            <Text color={on ? 'green' : 'red'}>{on ? '[✓] разрешены ' : '[ ] блокируются'}</Text>
-            <Text color={cur ? 'white' : 'gray'} bold={cur}> {c.title.padEnd(20)}</Text>
-            <Text color="gray" dimColor>{truncate(c.hint, Math.max(10, width - 46))}</Text>
+            {/* Как и в списке устройств: флажок и есть решение */}
+            <Text color={on ? 'green' : 'red'} bold>{on ? '[✓] ' : '[✗] '}</Text>
+            <Text color={cur ? 'white' : 'gray'} bold={cur}>{c.title.padEnd(22)}</Text>
+            <Text color="gray" dimColor>{truncate(c.hint, Math.max(10, width - 34))}</Text>
           </Box>
         );
       })}
