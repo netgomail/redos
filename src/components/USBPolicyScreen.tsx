@@ -105,16 +105,18 @@ export function USBPolicyScreen({ onExit }: Props) {
       // сейчас не воткнута, категория всё равно разрешена, и галочка должна стоять.
       setAllowed(new Set(applied.allowed.filter(c => !LOCKED_CATEGORIES.includes(c))));
       setAppliedTrusted(applied.trusted);
+      // Отметки показывают действующую политику: устройство, разрешённое
+      // исключением, обязано выглядеть отмеченным. Иначе выходит, что
+      // сохранение не сработало, хотя правило в файле есть.
+      setTrusted(new Set(applied.trusted.map(t => t.hash || `${t.deviceId}:${t.serial}`)));
     } else {
       // Первое включение: разрешено всё. Администратор снимает отметки с того,
       // что нужно заблокировать, и только после этого применяет. Так включение
       // контроля само по себе ничего не ломает — блокировка всегда осознанная.
       setAllowed(new Set(SELECTABLE_CATEGORIES.map(c => c.id)));
       setAppliedTrusted([]);
+      setTrusted(new Set());
     }
-    // Отметки всегда с чистого листа: что видно на экране, то и будет
-    // применено. Скрытого состояния, перенесённого из прошлой политики, нет.
-    setTrusted(new Set());
     setPhase('view');
   };
 

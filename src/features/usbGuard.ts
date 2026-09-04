@@ -383,7 +383,10 @@ export function fmtSize(bytes: number): string {
  */
 export function describeKind(d: GuardDevice): string {
   const disk = d.sysfs?.storage?.[0];
-  if (disk) return disk.sizeBytes ? disk.kind : `${disk.kind} (пусто)`;
+  if (disk) {
+    if (disk.sizeBytes) return disk.kind;
+    return disk.kind === 'картридер' ? 'картридер (нет карты)' : `${disk.kind} (пусто)`;
+  }
   if (d.remembered) return d.remembered.kind;
   if (d.categories.length) {
     return CATEGORIES.find(c => c.id === d.categories[0])?.title ?? d.categories[0];
@@ -487,6 +490,21 @@ export interface UsbStorageNode {
 
 const sysRead = (p: string): string => (readFile(p) ?? '').trim();
 
+/**
+ * Тип носителя словами. Основа та же, что в разделе «Носители информации»
+ * инвентаризации, плюс распознавание картридеров.
+ *
+ * Картридер отличается от флешки двумя признаками. Первый надёжный: флешка
+ * всегда сообщает свой размер, а пустой слот отдаёт ноль. Второй —
+ * перечисление форматов карт в модели («xD/SD/M.S.» у встроенного Realtek).
+ */
+function classifyUsbBlock(removable: boolean, sizeBytes: number, model: string): string {
+  if (!removable) return 'USB-накопитель';
+  const looksLikeReader = /xD|SD\b|M\.S\.|MMC|CF\b|CRW|card\s*reader/i.test(model);
+  if (looksLikeReader || sizeBytes === 0) return 'картридер';
+  return 'USB-флешка';
+}
+
 /** Блочные узлы, поднятые через USB, с привязкой к каталогу usb_device. */
 function usbBlockNodes(): Map<string, UsbStorageNode[]> {
   const byUsbDir = new Map<string, UsbStorageNode[]>();
@@ -506,17 +524,17 @@ function usbBlockNodes(): Map<string, UsbStorageNode[]> {
     const rawVendor  = readFile(`/sys/block/${name}/device/vendor`) ?? '';
     const rawModel   = readFile(`/sys/block/${name}/device/model`)  ?? '';
     const removable  = sysRead(`/sys/block/${name}/removable`) === '1';
+    const sizeBytes  = Number(sysRead(`/sys/block/${name}/size`) || 0) * 512;
     const rotational = sysRead(`/sys/block/${name}/queue/rotational`) === '1';
     const node: UsbStorageNode = {
       block:     name,
-      sizeBytes: Number(sysRead(`/sys/block/${name}/size`) || 0) * 512,
+      sizeBytes,
       model:     rawModel.trim(),
       vendor:    rawVendor.trim(),
       fullName:  joinScsiName(rawVendor, rawModel),
       removable,
       rotational,
-      // Та же логика, что в разделе «Носители информации» инвентаризации
-      kind: removable ? 'USB-флешка' : 'USB-накопитель',
+      kind: classifyUsbBlock(removable, sizeBytes, joinScsiName(rawVendor, rawModel)),
     };
     byUsbDir.set(dir, [...(byUsbDir.get(dir) ?? []), node]);
   }
