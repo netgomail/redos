@@ -34,9 +34,12 @@ export function USBPolicyScreen({ onExit }: Props) {
   const [status,  setStatus]  = useState<GuardStatus | null>(null);
   const [devices, setDevices] = useState<GuardDevice[]>([]);
 
-  // Разрешённые категории. Хабы принудительно разрешены всегда — их
-  // блокировка отключает всё, что подключено через них.
-  const [allowed, setAllowed] = useState<Set<CategoryId>>(new Set(['hub', 'input']));
+  // Разрешённые категории по умолчанию. Хабы и криптотокены разрешены
+  // принудительно (locked). Ввод — иначе машина останется без управления.
+  // Смарт-карты — там же живут CCID-модели Рутокена, а каналом утечки
+  // считыватель смарт-карт не является.
+  const [allowed, setAllowed] = useState<Set<CategoryId>>(
+    new Set(['hub', 'token', 'input', 'smartcard']));
   const [trusted, setTrusted] = useState<Set<string>>(new Set()); // ключ — hash или id:serial
 
   const [focus,     setFocus]     = useState<Focus>('categories');

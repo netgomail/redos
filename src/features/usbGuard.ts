@@ -206,12 +206,17 @@ async function detectServiceUnit(): Promise<string> {
 }
 
 export async function readStatus(): Promise<GuardStatus> {
-  const ver = await runPtyLines(['usbguard', '--version'], { env: C_LOCALE, timeoutMs: 8000 });
-  const installed = ver.some(l => /usbguard/i.test(l));
+  // Проверяем по коду возврата, а не по тексту: при отсутствии утилиты runPty
+  // возвращает код 127 и сообщение, в котором само слово «usbguard» и стоит.
+  const ver = await runPty(['usbguard', '--version'], { env: C_LOCALE, timeoutMs: 8000 });
+  const installed = ver.code === 0;
+  const verLine = installed
+    ? ver.output.split('\n').find(l => /\d+\.\d+/.test(l))?.trim() ?? ''
+    : '';
 
   const base: GuardStatus = {
     installed,
-    version:        ver.find(l => /\d+\.\d+/.test(l))?.trim() ?? '',
+    version:        verLine,
     serviceUnit:    'usbguard.service',
     serviceEnabled: false,
     serviceActive:  false,
