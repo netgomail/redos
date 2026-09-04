@@ -338,6 +338,16 @@ export function lookupUsbName(deviceId: string): string {
  * номер → блочный узел.
  */
 export function describeDevice(d: GuardDevice): string {
+  // Модель носителя информативнее дескриптора: у внешнего диска в дескрипторе
+  // стоит название USB-SATA-моста («ASMT105x»), а не самого диска.
+  const disk = d.sysfs?.storage?.[0];
+  if (disk?.fullName) return disk.fullName;
+  if (d.remembered?.model) return d.remembered.model;
+
+  const fromSysfs = [d.sysfs?.manufacturer, d.sysfs?.product]
+    .map(x => (x ?? '').trim()).filter(Boolean).join(' ');
+  if (fromSysfs) return fromSysfs;
+
   const fromDescriptor = d.name.trim();
   if (fromDescriptor) return fromDescriptor;
 
@@ -345,8 +355,39 @@ export function describeDevice(d: GuardDevice): string {
   if (fromDb) return fromDb;
 
   if (d.serial) return `без имени, S/N ${d.serial}`;
-  if (d.storageNodes?.length) return `без имени, /dev/${d.storageNodes[0]}`;
   return 'без имени';
+}
+
+/** Размер устройства с пометкой, если он взят из памяти, а не с живого носителя. */
+export function describeSize(d: GuardDevice): { text: string; stale: boolean } {
+  const disk = d.sysfs?.storage?.[0];
+  if (disk?.sizeBytes) return { text: fmtSize(disk.sizeBytes), stale: false };
+  if (disk)            return { text: 'нет носителя', stale: false };
+  if (d.remembered?.sizeBytes) return { text: fmtSize(d.remembered.sizeBytes), stale: true };
+  return { text: '—', stale: false };
+}
+
+/** Читаемый размер: 238,5 ГБ. */
+export function fmtSize(bytes: number): string {
+  if (!bytes) return '';
+  const u = ['Б', 'КБ', 'МБ', 'ГБ', 'ТБ'];
+  let v = bytes, i = 0;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return `${v.toFixed(v >= 100 || i < 2 ? 0 : 1).replace('.', ',')} ${u[i]}`;
+}
+
+/**
+ * Тип устройства человеческим языком — как в разделе «Носители информации»
+ * инвентаризации. Для накопителей берётся из sysfs, для прочего — категория.
+ */
+export function describeKind(d: GuardDevice): string {
+  const disk = d.sysfs?.storage?.[0];
+  if (disk) return disk.sizeBytes ? disk.kind : `${disk.kind} (пусто)`;
+  if (d.remembered) return d.remembered.kind;
+  if (d.categories.length) {
+    return CATEGORIES.find(c => c.id === d.categories[0])?.title ?? d.categories[0];
+  }
+  return `вне категорий: ${describeInterfaces(d.interfaces)}`;
 }
 
 // ─── устройства ──────────────────────────────────────────────────────────────
@@ -370,6 +411,10 @@ export interface GuardDevice {
    * — такой же канал утечки, как флешка, и это должно быть видно.
    */
   storageNodes?: string[];
+  /** Данные из sysfs: модель, производитель, размер, тип носителя. */
+  sysfs?: UsbSysfsDevice;
+  /** Что было известно, когда устройство в последний раз было разрешено. */
+  remembered?: RememberedDevice;
 }
 
 /**
@@ -409,63 +454,195 @@ export function parseDeviceLine(line: string): GuardDevice | null {
 }
 
 /**
- * USB-устройства, которые реально дают блочный узел.
+ * Всё, что известно о USB-устройствах из sysfs.
  *
- * Класс интерфейса — не гарантия: встроенный картридер Realtek объявляет
- * ff:06:50 (вендорский), но даёт /dev/sda, то есть является таким же каналом
- * утечки, как флешка. Поэтому «накопитель ли это» определяется не по классу,
- * а по факту наличия /sys/block/*, поднятого через USB.
+ * Читается напрямую, без внешних утилит, и работает даже для заблокированных
+ * устройств: деавторизованное устройство остаётся в дереве /sys, у него просто
+ * не конфигурируются интерфейсы. Поэтому модель и производителя видно и тогда,
+ * когда блочного узла уже нет.
  */
-export function listUsbStorage(): UsbStorageNode[] {
-  const out: UsbStorageNode[] = [];
+export interface UsbSysfsDevice {
+  port:         string;   // 2-4 — он же via-port в правилах usbguard
+  deviceId:     string;   // 24a9:205a
+  serial:       string;
+  manufacturer: string;
+  product:      string;
+  authorized:   boolean;
+  storage:      UsbStorageNode[];
+}
+
+export interface UsbStorageNode {
+  block:     string;   // sdc
+  sizeBytes: number;   // 0 — носитель не вставлен
+  model:     string;   // из /sys/block/sdX/device/model
+  vendor:    string;
+  /** Производитель и модель, склеенные с учётом границы SCSI-полей. */
+  fullName:  string;
+  removable: boolean;
+  rotational: boolean;
+  /** «USB-флешка», «USB-накопитель» — та же классификация, что в /inventory. */
+  kind:      string;
+}
+
+const sysRead = (p: string): string => (readFile(p) ?? '').trim();
+
+/**
+ * Склеивает производителя и модель из SCSI INQUIRY.
+ *
+ * Поля там фиксированной ширины: 8 байт под производителя и 16 под модель.
+ * Производители иногда пишут одно название через границу: у внешнего SSD на
+ * этой машине vendor="SPCC Sol", model="id State Disk" — это «SPCC Solid State
+ * Disk», разрезанный посередине слова. Признак — поле производителя заполнено
+ * целиком (8 символов без добивки), а модель начинается со строчной буквы.
+ * Иначе поля просто соединяются пробелом: "KDI-MSFT" + "Windows 10".
+ */
+function joinScsiName(rawVendor: string, rawModel: string): string {
+  const v = rawVendor.replace(/\s+$/, '');
+  const m = rawModel.trim();
+  if (!v) return m;
+  if (!m) return v;
+  const continues = rawVendor.length >= 8 && v.length === 8 && /^\p{Ll}/u.test(m);
+  return continues ? v + m : `${v} ${m}`;
+}
+
+/** Блочные узлы, поднятые через USB, с привязкой к каталогу usb_device. */
+function usbBlockNodes(): Map<string, UsbStorageNode[]> {
+  const byUsbDir = new Map<string, UsbStorageNode[]>();
   let names: string[];
-  try { names = readdirSync('/sys/block'); } catch { return out; }
+  try { names = readdirSync('/sys/block'); } catch { return byUsbDir; }
 
   for (const name of names) {
     let real: string;
     try { real = realpathSync(`/sys/block/${name}`); } catch { continue; }
     if (!/\/usb\d+\//.test(real)) continue;
 
-    // Поднимаемся до ближайшего предка с idVendor — это и есть usb_device
+    // Поднимаемся до ближайшего предка с idVendor — это usb_device
     let dir = real;
     while (dir !== '/' && !existsSync(join(dir, 'idVendor'))) dir = dirname(dir);
     if (dir === '/') continue;
 
-    const read = (f: string) => (readFile(join(dir, f)) ?? '').trim();
+    const rawVendor  = readFile(`/sys/block/${name}/device/vendor`) ?? '';
+    const rawModel   = readFile(`/sys/block/${name}/device/model`)  ?? '';
+    const removable  = sysRead(`/sys/block/${name}/removable`) === '1';
+    const rotational = sysRead(`/sys/block/${name}/queue/rotational`) === '1';
+    const node: UsbStorageNode = {
+      block:     name,
+      sizeBytes: Number(sysRead(`/sys/block/${name}/size`) || 0) * 512,
+      model:     rawModel.trim(),
+      vendor:    rawVendor.trim(),
+      fullName:  joinScsiName(rawVendor, rawModel),
+      removable,
+      rotational,
+      // Та же логика, что в разделе «Носители информации» инвентаризации
+      kind: removable ? 'USB-флешка' : 'USB-накопитель',
+    };
+    byUsbDir.set(dir, [...(byUsbDir.get(dir) ?? []), node]);
+  }
+  return byUsbDir;
+}
+
+export function listUsbSysfs(): UsbSysfsDevice[] {
+  const blocks = usbBlockNodes();
+  const out: UsbSysfsDevice[] = [];
+  let ports: string[];
+  try { ports = readdirSync('/sys/bus/usb/devices'); } catch { return out; }
+
+  for (const port of ports) {
+    const dir = `/sys/bus/usb/devices/${port}`;
+    if (!existsSync(join(dir, 'idVendor'))) continue;
+    let real = dir;
+    try { real = realpathSync(dir); } catch { /* оставляем как есть */ }
+
     out.push({
-      block:    name,
-      sysPath:  dir,
-      deviceId: `${read('idVendor')}:${read('idProduct')}`,
-      serial:   read('serial'),
-      size:     (readFile(`/sys/block/${name}/size`) ?? '0').trim(),
+      port,
+      deviceId:     `${sysRead(join(dir, 'idVendor'))}:${sysRead(join(dir, 'idProduct'))}`,
+      serial:       sysRead(join(dir, 'serial')),
+      manufacturer: sysRead(join(dir, 'manufacturer')),
+      product:      sysRead(join(dir, 'product')),
+      authorized:   sysRead(join(dir, 'authorized')) === '1',
+      storage:      blocks.get(real) ?? [],
     });
   }
   return out;
 }
 
-export interface UsbStorageNode {
-  block:    string;   // sda
-  sysPath:  string;   // /sys/bus/usb/devices/1-12
-  deviceId: string;   // 0bda:0129
-  serial:   string;
-  size:     string;   // в секторах по 512 байт; 0 — носитель не вставлен
+/** Осталось для совместимости: только устройства с блочными узлами. */
+export function listUsbStorage(): UsbSysfsDevice[] {
+  return listUsbSysfs().filter(d => d.storage.length > 0);
 }
 
 export async function listDevices(): Promise<GuardDevice[]> {
   const lines = await runPtyLines(['usbguard', 'list-devices'], { env: C_LOCALE, timeoutMs: 20_000 });
   const devices = lines.map(parseDeviceLine).filter((d): d is GuardDevice => d !== null);
 
-  // Отмечаем те, что дают блочный узел, — независимо от класса интерфейса
-  const storage = listUsbStorage();
+  // Обогащаем данными из sysfs: модель, размер, тип носителя. usbguard их не
+  // знает — он оперирует только атрибутами дескриптора, — а администратору
+  // нужно видеть то же, что показывает инвентаризация.
+  const sysfs = listUsbSysfs();
   for (const d of devices) {
-    const nodes = storage.filter(s =>
-      s.deviceId.toLowerCase() === d.deviceId.toLowerCase() &&
-      (!d.serial || !s.serial || s.serial === d.serial));
-    if (nodes.length > 0) {
-      d.storageNodes = nodes.map(n => n.block);
-    }
+    const match = sysfs.find(s => s.port === d.viaPort)
+      ?? sysfs.find(s => s.deviceId.toLowerCase() === d.deviceId.toLowerCase() &&
+                         (!d.serial || !s.serial || s.serial === d.serial));
+    if (!match) continue;
+    d.sysfs = match;
+    if (match.storage.length > 0) d.storageNodes = match.storage.map(n => n.block);
+  }
+
+  // Запоминаем размеры разрешённых и подставляем запомненное заблокированным
+  saveRemembered(devices);
+  const cache = loadRemembered();
+  for (const d of devices) {
+    if (d.sysfs?.storage?.length) continue;
+    const r = cache[rememberKey(d)];
+    if (r) d.remembered = r;
   }
   return devices;
+}
+
+// ─── память об устройствах ───────────────────────────────────────────────────
+
+const CACHE_FILE = '/var/lib/redos/usb-devices.json';
+
+export interface RememberedDevice {
+  model:     string;
+  kind:      string;
+  sizeBytes: number;
+  seen:      string;   // ISO-дата последнего подключения
+}
+
+/**
+ * Заблокированное устройство не отдаёт ни размера, ни типа носителя: ядро не
+ * конфигурирует его интерфейсы, блочного узла не появляется. Производитель и
+ * модель в sysfs остаются, а размер спросить не у кого.
+ *
+ * Поэтому то, что удалось узнать, пока устройство было разрешено, сохраняется
+ * и показывается с пометкой «по данным последнего подключения». Выдавать это
+ * за текущее состояние нельзя — флешку могли подменить.
+ */
+function loadRemembered(): Record<string, RememberedDevice> {
+  try { return JSON.parse(readFile(CACHE_FILE) ?? '{}'); } catch { return {}; }
+}
+
+function rememberKey(d: GuardDevice): string {
+  return d.hash || `${d.deviceId}:${d.serial}`;
+}
+
+function saveRemembered(devices: GuardDevice[]): void {
+  const cache = loadRemembered();
+  let changed = false;
+  for (const d of devices) {
+    const disk = d.sysfs?.storage?.[0];
+    if (!disk || !disk.sizeBytes) continue;
+    const model = disk.fullName;
+    const key = rememberKey(d);
+    const prev = cache[key];
+    if (prev && prev.sizeBytes === disk.sizeBytes && prev.model === model) continue;
+    cache[key] = { model, kind: disk.kind, sizeBytes: disk.sizeBytes, seen: new Date().toISOString() };
+    changed = true;
+  }
+  if (!changed) return;
+  sudoRun(['mkdir', '-p', '/var/lib/redos']);
+  writeSudo(CACHE_FILE, JSON.stringify(cache, null, 2) + '\n');
 }
 
 // ─── установка ───────────────────────────────────────────────────────────────

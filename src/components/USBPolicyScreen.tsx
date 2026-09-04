@@ -4,7 +4,7 @@ import { Spinner } from './Spinner';
 import {
   CATEGORIES, SELECTABLE_CATEGORIES, LOCKED_CATEGORIES,
   readStatus, listDevices, install, applyPolicy, removePolicy, removeLegacyUdev,
-  readAppliedPolicy, describeDevice, describeInterfaces,
+  readAppliedPolicy, describeDevice, describeInterfaces, describeKind, describeSize,
 } from '../features/usbGuard';
 import type {
   CategoryId, GuardStatus, GuardDevice, TrustedDevice,
@@ -335,12 +335,16 @@ export function USBPolicyScreen({ onExit }: Props) {
         );
       })}
 
-      <Box paddingLeft={2} marginTop={1}><Text color="cyan" bold>── Подключённые устройства ──</Text></Box>
+      <Box paddingLeft={2} marginTop={1}>
+        <Text color="cyan" bold>── Подключённые устройства ──</Text>
+        <Text color="gray" dimColor>  ~ размер по данным последнего подключения</Text>
+      </Box>
       <Box paddingLeft={2}>
         <Text color="gray" dimColor>
           {/* ширины те же, что у строк ниже, иначе колонки разъедутся */}
           {'  ' + 'дов'.padEnd(3) + ' состояние  '.padEnd(13) +
-           'ид.'.padEnd(10) + ' ' + 'устройство'.padEnd(29) + 'категория'}
+           'ид.'.padEnd(10) + ' ' + 'устройство'.padEnd(26) +
+           'тип'.padEnd(19) + 'размер'.padEnd(11) + 'узел'}
         </Text>
       </Box>
       {managedDevices.length === 0 ? (
@@ -361,12 +365,12 @@ export function USBPolicyScreen({ onExit }: Props) {
         const tr  = trusted.has(keyOf(d));
         // Блочный узел важнее класса: картридер с вендорским классом — такой же
         // канал утечки, как флешка, и админ должен это видеть.
-        const nodes = d.storageNodes?.length ? d.storageNodes.map(n => '/dev/' + n).join(' ') : '';
-        // «вне категорий» само по себе ничего не говорит — показываем классы
-        // интерфейсов словами, чтобы было понятно, что это за устройство.
-        const cats = d.categories.length
-          ? d.categories.map(c => CATEGORIES.find(x => x.id === c)?.title ?? c).join(', ')
-          : `вне категорий: ${describeInterfaces(d.interfaces) || 'интерфейсы неизвестны'}`;
+        const nodes = d.storageNodes?.length ? d.storageNodes.map(n => '/dev/' + n).join(' ') : '—';
+        const size  = describeSize(d);
+        // Тип — как в инвентаризации: «USB-флешка», «USB-накопитель». Для
+        // не-накопителей вместо типа показываем категорию, а для устройств
+        // вне категорий — классы интерфейсов словами.
+        const kind = describeKind(d);
         return (
           <Box key={keyOf(d) + i} paddingLeft={2}>
             <Text color={cur ? 'white' : 'gray'}>{cur ? '❯ ' : '  '}</Text>
@@ -375,12 +379,15 @@ export function USBPolicyScreen({ onExit }: Props) {
               {d.target === 'allow' ? ' ✓ разрешено ' : ' ✗ заблокир. '}
             </Text>
             <Text color={cur ? 'white' : 'gray'} bold={cur}>
-              {(d.deviceId || '—').padEnd(10)} {truncate(describeDevice(d), 29).padEnd(29)}
+              {(d.deviceId || '—').padEnd(10)} {truncate(describeDevice(d), 25).padEnd(26)}
             </Text>
             <Text color={d.uncategorized ? 'yellow' : 'gray'} dimColor={!d.uncategorized}>
-              {d.uncategorized ? '⚠ ' : ''}{truncate(cats, Math.max(8, width - 64))}
+              {truncate(kind, 18).padEnd(19)}
             </Text>
-            {nodes !== '' && <Text color="red"> {nodes}</Text>}
+            <Text color={size.stale ? 'yellow' : 'gray'} dimColor={!size.stale}>
+              {truncate(size.stale ? size.text + ' ~' : size.text, 10).padEnd(11)}
+            </Text>
+            <Text color={nodes === '—' ? 'gray' : 'red'} dimColor={nodes === '—'}>{nodes}</Text>
           </Box>
         );
       })}
