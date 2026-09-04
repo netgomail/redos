@@ -23,6 +23,9 @@ type Phase =
 
 type Focus = 'categories' | 'devices' | 'actions';
 
+/** Сколько строк устройств показывать разом. */
+const DEV_ROWS = 8;
+
 type ActionId = 'apply' | 'legacy' | 'remove' | 'refresh';
 interface Action { id: ActionId; title: string; hint: string }
 
@@ -51,6 +54,15 @@ export function USBPolicyScreen({ onExit }: Props) {
   const alive = useRef(true);
   useEffect(() => () => { alive.current = false; }, []);
 
+  /**
+   * В списке только те устройства, судьба которых зависит от политики.
+   * Хабы, клавиатуры, токены и смарт-карты разрешены всегда — показывать их
+   * нечего, а место они занимают.
+   */
+  const managedDevices = devices.filter(d =>
+    d.categories.length === 0 ||
+    d.categories.some(c => !LOCKED_CATEGORIES.includes(c)));
+
   const refresh = async () => {
     setPhase('loading');
     const st = await readStatus();
@@ -61,6 +73,7 @@ export function USBPolicyScreen({ onExit }: Props) {
     const devs = await listDevices();
     if (!alive.current) return;
     setDevices(devs);
+    setDevIdx(0);
 
     // Восстанавливаем текущий выбор из того, что реально разрешено сейчас:
     // если политика уже наша, показываем её состояние, а не умолчания.
@@ -178,7 +191,7 @@ export function USBPolicyScreen({ onExit }: Props) {
     // phase === 'view'
     if (k('q') || key.escape) { onExit(); return; }
     if (key.tab) {
-      setFocus(f => f === 'categories' ? (devices.length ? 'devices' : 'actions')
+      setFocus(f => f === 'categories' ? (managedDevices.length ? 'devices' : 'actions')
                   : f === 'devices'    ? 'actions'
                   :                      'categories');
       return;
@@ -201,9 +214,9 @@ export function USBPolicyScreen({ onExit }: Props) {
 
     if (focus === 'devices') {
       if (key.upArrow)   setDevIdx(i => Math.max(0, i - 1));
-      if (key.downArrow) setDevIdx(i => Math.min(Math.max(0, devices.length - 1), i + 1));
+      if (key.downArrow) setDevIdx(i => Math.min(Math.max(0, managedDevices.length - 1), i + 1));
       if (char === ' ') {
-        const d = devices[devIdx];
+        const d = managedDevices[devIdx];
         if (!d) return;
         setTrusted(prev => {
           const next = new Set(prev);
@@ -281,6 +294,10 @@ export function USBPolicyScreen({ onExit }: Props) {
 
   const st = status!;
   const blocked = devices.filter(d => d.target !== 'allow').length;
+  // Окно прокрутки: держим выбранную строку внутри видимой части
+  const devStart = Math.max(0, Math.min(
+    devIdx - Math.floor(DEV_ROWS / 2),
+    managedDevices.length - DEV_ROWS));
   const subtitle = [
     st.version || 'usbguard',
     st.serviceActive ? (st.managed ? 'политика redos активна' : 'работает чужая политика') : 'демон остановлен',
@@ -326,13 +343,20 @@ export function USBPolicyScreen({ onExit }: Props) {
            'ид.'.padEnd(10) + ' ' + 'устройство'.padEnd(29) + 'категория'}
         </Text>
       </Box>
-      {devices.length === 0 ? (
+      {managedDevices.length === 0 ? (
         <Box paddingLeft={3}>
           <Text color="gray" dimColor>
-            {st.serviceActive ? 'usbguard не отдал список' : 'демон остановлен — список пуст'}
+            {!st.serviceActive ? 'демон остановлен — список пуст'
+             : devices.length  ? 'все подключённые устройства из всегда разрешённых категорий'
+             :                   'usbguard не отдал список'}
           </Text>
         </Box>
-      ) : devices.slice(0, 8).map((d, i) => {
+      ) : <>
+      {devStart > 0 && (
+        <Box paddingLeft={4}><Text color="gray" dimColor>↑ выше ещё {devStart}</Text></Box>
+      )}
+      {managedDevices.slice(devStart, devStart + DEV_ROWS).map((d, vi) => {
+        const i = devStart + vi;
         const cur = focus === 'devices' && i === devIdx;
         const tr  = trusted.has(keyOf(d));
         // Блочный узел важнее класса: картридер с вендорским классом — такой же
@@ -360,9 +384,12 @@ export function USBPolicyScreen({ onExit }: Props) {
           </Box>
         );
       })}
-      {devices.length > 8 && (
-        <Box paddingLeft={5}><Text color="gray" dimColor>…и ещё {devices.length - 8}</Text></Box>
+      {devStart + DEV_ROWS < managedDevices.length && (
+        <Box paddingLeft={4}>
+          <Text color="gray" dimColor>↓ ниже ещё {managedDevices.length - devStart - DEV_ROWS}</Text>
+        </Box>
       )}
+      </>}
 
       <Box paddingLeft={2} marginTop={1}><Text color="cyan" bold>── Действия ──</Text></Box>
       {actions.map((a, i) => {
