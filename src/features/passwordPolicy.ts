@@ -49,15 +49,21 @@ export const PRESETS: Preset[] = [
   {
     id: 'basic',
     title: 'Базовая',
-    hint:  'minlen=8, классов 4, смена раз в 90 дней',
-    pwquality: { minlen: 8,  minclass: 4, dcredit: -1, ucredit: -1, lcredit: -1, ocredit: -1, difok: 5, retry: 3 },
+    hint:  'minlen=8, классов 3, смена раз в 90 дней',
+    // *credit=0 обязательно: значение -1 требует минимум один символ КАЖДОГО
+    // класса, то есть принудительно все четыре, и minclass=3 не имел бы
+    // никакого эффекта. С нулями число классов задаёт именно minclass.
+    pwquality: { minlen: 8,  minclass: 3, dcredit: 0, ucredit: 0, lcredit: 0, ocredit: 0, difok: 5, retry: 3 },
     login:     { PASS_MAX_DAYS: 90, PASS_MIN_DAYS: 1, PASS_WARN_AGE: 7 },
   },
   {
     id: 'strong',
     title: 'Усиленная',
-    hint:  'minlen=12, классов 4, смена раз в 60 дней',
-    pwquality: { minlen: 12, minclass: 4, dcredit: -1, ucredit: -1, lcredit: -1, ocredit: -1, difok: 5, retry: 3 },
+    hint:  'minlen=10, классов 4, смена раз в 60 дней',
+    // Здесь minclass=4 и *credit=-1 требуют одного и того же — все четыре
+    // класса, — поэтому -1 оставлены: они дополнительно фиксируют, что это
+    // цифра, прописная, строчная и спецсимвол, а не любые четыре класса.
+    pwquality: { minlen: 10, minclass: 4, dcredit: -1, ucredit: -1, lcredit: -1, ocredit: -1, difok: 5, retry: 3 },
     login:     { PASS_MAX_DAYS: 60, PASS_MIN_DAYS: 1, PASS_WARN_AGE: 14 },
   },
 ];
