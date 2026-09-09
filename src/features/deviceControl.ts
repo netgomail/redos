@@ -84,9 +84,11 @@ function removeLegacyFiles(): number {
  * из одного класса. «Сеть и модемы» — это 02 и 0a: потеряется один, и
  * категория прочитается как запрещённая, хотя запрещали не её.
  *
- * Версия 2 — udev-политика; 1 была у файла правил USBGuard.
+ * Версия 2 — udev-политика; 1 была у файла правил USBGuard. Версия 3 добавила
+ * второй рубеж по блочному узлу и опознание накопителя по SCSI-переносу:
+ * обе живут в скрипте и правиле, поэтому старую установку нужно переприменить.
  */
-const POLICY_VERSION  = 2;
+const POLICY_VERSION  = 3;
 const VERSION_MARK    = '# redos-device-control-version:';
 const CATEGORIES_MARK = '# redos-device-control-categories:';
 // ─── категории устройств ─────────────────────────────────────────────────────
@@ -150,6 +152,34 @@ export const TOKEN_DEVICE_IDS = [
  * ради которого всё и делается.
  */
 const STORAGE_CLASS = '08';
+
+/**
+ * Подкласс SCSI и протоколы переноса, по которым интерфейс опознаётся как
+ * накопитель независимо от заявленного класса.
+ *
+ * Встроенный картридер Realtek объявляет ff:06:50 — вендорский класс, — но
+ * 06 это SCSI, а 50 Bulk-Only Transport: перед нами накопитель, и ядро видит
+ * его так же, привязывая ums-realtek по совпадению class/subclass/protocol.
+ * Считать такой интерфейс вендорским значило бы оставить его вне категорий
+ * навсегда: администратор разрешает «Накопители», а картридер остаётся
+ * заблокированным, хотя это ровно накопитель и есть.
+ *
+ * Обратная сторона важнее: нормализация загоняет замаскированный накопитель
+ * ПОД запрет категории, а не выводит из-под него. Устройство, объявившее
+ * ff:06:50, при выключенных накопителях блокируется по той же галочке.
+ */
+const SCSI_SUBCLASS   = '06';
+const SCSI_PROTOCOLS  = ['50', '62'];   // Bulk-Only Transport и UAS
+
+/**
+ * Класс интерфейса, по которому принимается решение: заявленный, а для
+ * SCSI-переноса — накопитель, чем бы устройство себя ни называло.
+ */
+export function effectiveClass(iface: string): string {
+  const [cls, sub, proto] = iface.toLowerCase().split(':');
+  if (sub === SCSI_SUBCLASS && SCSI_PROTOCOLS.includes(proto ?? '')) return STORAGE_CLASS;
+  return cls ?? '';
+}
 
 export interface Category {
   id:      CategoryId;
@@ -235,7 +265,7 @@ export function categoriesOf(interfaces: string[], deviceId = ''): CategoryId[] 
   for (const c of CATEGORIES) {
     if (c.ids?.some(p => idMatches(deviceId, p))) { out.add(c.id); continue; }
     for (const iface of interfaces) {
-      const cls = iface.split(':')[0]?.toLowerCase();
+      const cls = effectiveClass(iface);
       if (cls && c.classes.some(p => p.split(':')[0].toLowerCase() === cls)) { out.add(c.id); break; }
     }
   }
@@ -429,9 +459,20 @@ export function explainPolicy(d: UsbDevice, allowed: Set<CategoryId>): string {
 
   const stale = SOURCE_NOTE[source];
   const problems: string[] = [];
-  for (const cls of new Set(ifaces.map(i => i.split(':')[0].toLowerCase()))) {
+  const seen = new Set<string>();
+  for (const iface of ifaces) {
+    const cls = effectiveClass(iface);
+    if (seen.has(cls)) continue;
+    seen.add(cls);
     if (active.some(c => c.classes.some(p => p.split(':')[0].toLowerCase() === cls))) continue;
-    const name = `${cls} — ${CLASS_NAMES[cls] ?? 'неизвестный класс'}`;
+
+    // Заявленный класс называем как есть, а если решение приняли не по нему —
+    // говорим об этом прямо: иначе строка спорит с колонкой типа.
+    const declared = iface.split(':')[0]?.toLowerCase() ?? cls;
+    const name = declared === cls
+      ? `${cls} — ${CLASS_NAMES[cls] ?? 'неизвестный класс'}`
+      : `${iface} — накопитель по SCSI-переносу, хоть и класс ${declared}`;
+
     // Класс, который вообще не покрыт категориями, включением галочки не
     // разрешить: для него есть только поимённое исключение.
     const owner = CATEGORIES.find(c => c.classes.some(p => p.split(':')[0].toLowerCase() === cls));
@@ -782,12 +823,12 @@ export function allowedByCategories(d: UsbDevice, allowed: Set<CategoryId>): boo
   // Категории, опознаваемые по идентификатору (токены), — отдельным правилом.
   // Условие none-of { 08:*:* } из правил повторяем здесь: устройство с
   // накопительным интерфейсом по идентификатору токена не проходит.
-  const isStorage = d.interfaces.some(i => i.split(':')[0].toLowerCase() === STORAGE_CLASS);
+  const isStorage = d.interfaces.some(i => effectiveClass(i) === STORAGE_CLASS);
   if (!isStorage && active.some(c => c.ids?.some(pat => idMatches(d.deviceId, pat)))) return true;
 
   if (d.interfaces.length === 0) return false;
   const classes = new Set(active.flatMap(c => c.classes).map(p => p.split(':')[0].toLowerCase()));
-  return d.interfaces.every(i => classes.has(i.split(':')[0].toLowerCase()));
+  return d.interfaces.every(i => classes.has(effectiveClass(i)));
 }
 
 /**
@@ -903,6 +944,23 @@ export function readAppliedPolicy(): PolicyInput | null {
   return parseAppliedPolicy(readFile(POLICY_FILE));
 }
 
+/**
+ * Версия, которой записан файл политики. 0 — файл не наш или без отметки.
+ *
+ * Читать её обязательно: скрипт и правило меняются от версии к версии, а на
+ * машине остаётся то, что записали при последнем применении. Версия 3
+ * принесла рубеж по блочному узлу — без переприменения его там просто нет,
+ * и об этом администратор должен узнать от утилиты, а не из README.
+ */
+export function appliedVersion(text: string | null): number {
+  if (!text || !text.includes(HEADER_MARK)) return 0;
+  const line = text.split('\n').find(l => l.startsWith(VERSION_MARK));
+  return Number(line?.slice(VERSION_MARK.length).trim()) || 0;
+}
+
+/** Текущая версия формата — с ней сравнивается записанное на машине. */
+export const CURRENT_POLICY_VERSION = POLICY_VERSION;
+
 /** Разбор файла политики. Отделён от чтения, чтобы поддаваться проверке. */
 export function parseAppliedPolicy(text: string | null): PolicyInput | null {
   if (!text || !text.includes(HEADER_MARK)) return null;
@@ -936,12 +994,19 @@ export function parseAppliedPolicy(text: string | null): PolicyInput | null {
 // ─── файлы на машине ─────────────────────────────────────────────────────────
 
 /**
- * udev-правило: одна строка на каждое событие интерфейса.
+ * udev-правило: два рубежа, оба ведут в один скрипт.
  *
- * Событие usb_interface, а не usb_device, выбрано намеренно: на нём класс уже
- * известен ядру, тогда как в момент add самого устройства каталоги интерфейсов
- * могут ещё не появиться. Решение всё равно принимается по устройству целиком
- * — скрипт поднимается к нему сам.
+ * Первый — событие usb_interface, а не usb_device: на нём класс уже известен
+ * ядру, тогда как в момент add самого устройства каталоги интерфейсов могут
+ * ещё не появиться. Решение всё равно принимается по устройству целиком —
+ * скрипт поднимается к нему сам.
+ *
+ * Второй — появление блочного узла. Он ловит то, что первый пропускает по
+ * определению: политика по классам верит дескриптору, а ядро привязывает
+ * драйверы ещё и по vid:pid. Устройство, объявившее себя клавиатурой, но
+ * подставившее идентификаторы известного накопителя, получит usb-storage —
+ * класс при этом остаётся разрешённым, и первый рубеж его пропустит.
+ * Появившийся /dev/sdX подделать уже нечем: это факт, а не заявление.
  */
 export function generateRules(): string {
   return [
@@ -949,10 +1014,15 @@ export function generateRules(): string {
     '# Управляется утилитой redos (/usb-policy). Не редактируйте вручную.',
     '#',
     '# Политика — в /etc/redos/device-control.conf, решение принимает',
-    '# /usr/local/sbin/redos-block-usb.sh. Здесь только вызов: udev видит',
+    '# /usr/local/sbin/redos-block-usb.sh. Здесь только вызовы: udev видит',
     '# интерфейсы по одному, а разрешение зависит от всех сразу.',
     '',
     'ACTION!="add",             GOTO="redos_dc_end"',
+    '',
+    '# Рубеж по факту: блочный узел на USB-устройстве, которому накопитель',
+    '# не разрешён. Проверка идёт вместо класса, а не вместе с ним.',
+    `SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", RUN+="${BLOCK_SCRIPT} --storage $devpath", GOTO="redos_dc_end"`,
+    '',
     'SUBSYSTEM!="usb",          GOTO="redos_dc_end"',
     'ENV{DEVTYPE}!="usb_interface", GOTO="redos_dc_end"',
     '',
@@ -971,9 +1041,14 @@ export const BLOCK_SCRIPT_BODY = `#!/bin/sh
 ${HEADER_MARK}
 # Управляется утилитой redos (/usb-policy). Не редактируйте вручную.
 #
-# Вызывается из ${RULES_FILE} на событии usb_interface: $1 — DEVPATH интерфейса.
-# Поднимается к USB-устройству и снимает авторизацию, если устройство не
+# Вызывается из ${RULES_FILE} в двух режимах:
+#   $1 = DEVPATH интерфейса             — решение по классам интерфейсов;
+#   --storage, $2 = DEVPATH блочного    — решение по факту появления диска.
+# Оба поднимаются к USB-устройству и снимают авторизацию, если устройство не
 # проходит политику из ${POLICY_FILE}.
+
+mode=interface
+if [ "$1" = --storage ]; then mode=storage; shift; fi
 
 conf=${POLICY_FILE}
 [ -r "$conf" ] || exit 0
@@ -1027,34 +1102,57 @@ has() {
   return 1
 }
 
-# Классы всех интерфейсов устройства: решение принимается по ним целиком.
-classes=""
-for i in "$dev"/"$port":*; do
-  [ -r "$i/bInterfaceClass" ] || continue
-  classes="$classes $(cat "$i/bInterfaceClass")"
-done
-[ -n "$classes" ] || exit 0
+# Разрешён ли накопитель — нужно и рубежу по блочному узлу, и проверке ниже.
+storage_ok=no
+case " $allowed " in *" ${STORAGE_CLASS} "*) storage_ok=yes ;; esac
 
-# 1. Доверенные поимённо — проходят при любой политике.
+# Доверенные поимённо проходят в обоих режимах: администратор внёс устройство
+# в исключения зная, что это, и его слово выше любой категории.
 for t in $trusted; do
   [ "$t" = "$vid:$pid:$serial" ] && exit 0
 done
 
-# 2. Опасные комбинации (BadUSB): накопитель, притворяющийся ещё и
+# Рубеж по факту: на устройстве появился блочный узел. Класс интерфейса тут
+# уже не спрашиваем — он и был тем, чему верить нельзя.
+if [ "$mode" = storage ]; then
+  [ "$storage_ok" = yes ] && exit 0
+  block
+fi
+
+# Классы всех интерфейсов устройства: решение принимается по ним целиком.
+#
+# Класс нормализуется: подкласс 06 (SCSI) с протоколом 50 (Bulk-Only) или 62
+# (UAS) — это накопитель, каким бы класс себя ни объявлял. Так встроенный
+# картридер с вендорским ff:06:50 подчиняется галочке «Накопители», а не висит
+# вне категорий, и замаскированный накопитель попадает под её запрет.
+classes=""
+for i in "$dev"/"$port":*; do
+  [ -r "$i/bInterfaceClass" ] || continue
+  cls=$(cat "$i/bInterfaceClass")
+  sub=$(cat "$i/bInterfaceSubClass" 2>/dev/null)
+  proto=$(cat "$i/bInterfaceProtocol" 2>/dev/null)
+  if [ "$sub" = "${SCSI_SUBCLASS}" ]; then
+    case "$proto" in ${SCSI_PROTOCOLS.join('|')}) cls=${STORAGE_CLASS} ;; esac
+  fi
+  classes="$classes $cls"
+done
+[ -n "$classes" ] || exit 0
+
+# 1. Опасные комбинации (BadUSB): накопитель, притворяющийся ещё и
 #    клавиатурой, сетевой картой или радиомодулем. Проверяется до разрешений:
 #    иначе такое устройство прошло бы по разрешённой категории.
 if has 08 && { has 03 || has 02 || has e0; }; then
   block
 fi
 
-# 3. Криптотокены по идентификатору — но не те, что объявляют накопитель.
+# 2. Криптотокены по идентификатору — но не те, что объявляют накопитель.
 if ! has 08; then
   for t in $tokens; do
     [ "$t" = "$vid:$pid" ] && exit 0
   done
 fi
 
-# 4. Все интерфейсы должны попадать в разрешённые классы (match-all).
+# 3. Все интерфейсы должны попадать в разрешённые классы (match-all).
 for c in $classes; do
   case " $allowed " in
     *" $c "*) ;;
@@ -1103,6 +1201,11 @@ export interface PolicyStatus {
   scriptFile:  boolean;
   /** Сколько устройств деавторизовано прямо сейчас. */
   blockedNow:  number;
+  /**
+   * Политика записана прошлой версией утилиты: файлы на месте, но скрипт и
+   * правило — старые. Лечится повторным применением.
+   */
+  outdated:    boolean;
   /** Чужие udev-правила по USB — они применяются вместе с нашим. */
   conflicts:   string[];
   /** Остатки контроля на USBGuard: пакет, служба, правила. */
@@ -1110,7 +1213,8 @@ export interface PolicyStatus {
 }
 
 export async function readStatus(): Promise<PolicyStatus> {
-  const applied = readAppliedPolicy();
+  const policyText = readFile(POLICY_FILE);
+  const applied = parseAppliedPolicy(policyText);
   const rules   = readFile(RULES_FILE);
   const legacyPresent = LEGACY_FILES.some(f => readFile(f)?.includes(LEGACY_MARK) ?? false);
   const script  = readFile(BLOCK_SCRIPT);
@@ -1123,6 +1227,7 @@ export async function readStatus(): Promise<PolicyStatus> {
     rulesFile:  rules?.includes(HEADER_MARK) ?? false,
     scriptFile: script?.includes(HEADER_MARK) ?? false,
     blockedNow: blocked,
+    outdated:   applied !== null && appliedVersion(policyText) < POLICY_VERSION,
     conflicts:  findConflictingRules(),
     usbguard:   await findUsbGuardTraces(),
   };

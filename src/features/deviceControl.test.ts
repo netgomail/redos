@@ -16,7 +16,8 @@ import {
   CATEGORIES, TOKEN_DEVICE_IDS, LOCKED_CATEGORIES,
   generatePolicy, generateRules, parseAppliedPolicy, validatePolicyInput,
   allowedByCategories, categoriesOf, BLOCK_SCRIPT_BODY, portsToReauthorize,
-  predictTarget, explainPolicy, describeKind,
+  predictTarget, explainPolicy, describeKind, effectiveClass,
+  appliedVersion, CURRENT_POLICY_VERSION,
 } from './deviceControl';
 import type { UsbDevice, PolicyInput, UsbSysfsDevice } from './deviceControl';
 
@@ -147,7 +148,10 @@ describe('категории устройства', () => {
  * временного каталога. Логика — та же самая, что уедет на машину.
  */
 interface ScriptCase {
-  /** Классы интерфейсов, как они лежат в sysfs: ['08', '03']. */
+  /**
+   * Интерфейсы: либо один класс («08»), либо класс с подклассом и протоколом
+   * («ff:06:50») — тогда в sysfs лягут все три файла, как у настоящего.
+   */
   interfaces: string[];
   policyText: string;
   vendor?:  string;
@@ -155,6 +159,11 @@ interface ScriptCase {
   serial?:  string;
   /** Состояние authorized до прогона. По умолчанию устройство разрешено. */
   authorized?: '0' | '1';
+  /**
+   * Прогон рубежа по блочному узлу: скрипт зовётся так же, как из правила на
+   * SUBSYSTEM=="block" — с путём диска, а не интерфейса.
+   */
+  storageNode?: boolean;
 }
 
 function decide(opts: ScriptCase): 'allow' | 'block' {
@@ -167,11 +176,19 @@ function decide(opts: ScriptCase): 'allow' | 'block' {
     writeFileSync(join(dev, 'idVendor'),  opts.vendor  ?? '24a9');
     writeFileSync(join(dev, 'idProduct'), opts.product ?? '205a');
     writeFileSync(join(dev, 'serial'),    opts.serial  ?? '89880401');
-    opts.interfaces.forEach((cls: string, i: number) => {
+    opts.interfaces.forEach((spec: string, i: number) => {
       const iface = join(dev, `${port}:1.${i}`);
       mkdirSync(iface, { recursive: true });
-      writeFileSync(join(iface, 'bInterfaceClass'), cls);
+      const [cls, sub, proto] = spec.split(':');
+      writeFileSync(join(iface, 'bInterfaceClass'), cls!);
+      if (sub)   writeFileSync(join(iface, 'bInterfaceSubClass'), sub);
+      if (proto) writeFileSync(join(iface, 'bInterfaceProtocol'), proto);
     });
+
+    // Блочный узел где-то под интерфейсом — так он и лежит у настоящей флешки:
+    // .../2-4/2-4:1.0/host0/target0:0:0/0:0:0:0/block/sdb
+    const nodePath = `/devices/pci0000:00/usb2/${port}/${port}:1.0/host0/block/sdb`;
+    if (opts.storageNode) mkdirSync(join(root, 'sys' + nodePath), { recursive: true });
     const conf = join(root, 'policy.conf');
     writeFileSync(conf, opts.policyText);
     writeFileSync(join(root, 'mounts'), '');
@@ -182,8 +199,10 @@ function decide(opts: ScriptCase): 'allow' | 'block' {
       .replace('while [ "$dev" != /sys ]', `while [ "$dev" != ${root}/sys ]`)
       .replace(/\/proc\/self\/mounts/g, join(root, 'mounts')), { mode: 0o755 });
 
-    Bun.spawnSync(['sh', script, `/devices/pci0000:00/usb2/${port}/${port}:1.0`],
-                  { stdout: 'pipe', stderr: 'pipe' });
+    const args = opts.storageNode
+      ? ['--storage', nodePath]
+      : [`/devices/pci0000:00/usb2/${port}/${port}:1.0`];
+    Bun.spawnSync(['sh', script, ...args], { stdout: 'pipe', stderr: 'pipe' });
     return readSync(join(dev, 'authorized')) === '0' ? 'block' : 'allow';
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -247,8 +266,99 @@ describe('скрипт решения', () => {
     })).toBe('block');
   });
 
+  test('накопитель с вендорским классом подчиняется категории', () => {
+    // Встроенный картридер Realtek: класс ff, но подкласс 06 (SCSI) и
+    // протокол 50 (Bulk-Only) — это накопитель, и ядро видит его так же.
+    const asStorage = { interfaces: ['ff:06:50'] };
+    expect(decide({ ...asStorage, policyText: generatePolicy(policy()) })).toBe('block');
+    expect(decide({ ...asStorage, policyText: generatePolicy(policy({ allowed: ['storage'] })) }))
+      .toBe('allow');
+  });
+
+  test('вендорский класс без SCSI-переноса остаётся вне категорий', () => {
+    // Wi-Fi-донгл RTL8188 объявляет ff:ff:ff. Разрешить его можно только
+    // поимённо: включение любой категории на него не действует.
+    const dongle = { interfaces: ['ff:ff:ff'] };
+    expect(decide({ ...dongle, policyText: generatePolicy(policy({ allowed: ['network', 'wireless'] })) }))
+      .toBe('block');
+    expect(decide({ ...dongle, policyText: generatePolicy(policy({
+      trusted: [{ deviceId: '24a9:205a', serial: '89880401', name: '' }],
+    })) })).toBe('allow');
+  });
+
+  test('накопитель, объявивший себя клавиатурой, ловится по блочному узлу', () => {
+    // Обход политики по классам: устройство объявляет разрешённый класс, но
+    // подставляет vid:pid известного накопителя — ядро привязывает драйвер по
+    // идентификаторам, и usb-storage загружается мимо решения по классу.
+    // По классу такое устройство проходит:
+    expect(decide({ interfaces: ['03'], policyText: generatePolicy(policy()) })).toBe('allow');
+    // а появившийся диск подделать уже нечем:
+    expect(decide({ interfaces: ['03'], storageNode: true, policyText: generatePolicy(policy()) }))
+      .toBe('block');
+  });
+
+  test('при разрешённых накопителях блочный узел не мешает', () => {
+    expect(decide({
+      interfaces: ['08'], storageNode: true,
+      policyText: generatePolicy(policy({ allowed: ['storage'] })),
+    })).toBe('allow');
+  });
+
+  test('доверенному устройству блочный узел разрешён', () => {
+    expect(decide({
+      interfaces: ['08'], storageNode: true,
+      policyText: generatePolicy(policy({
+        trusted: [{ deviceId: '24a9:205a', serial: '89880401', name: '' }],
+      })),
+    })).toBe('allow');
+  });
+
   test('без файла политики скрипт ничего не блокирует', () => {
     expect(decide({ interfaces: ['08'], policyText: '' })).toBe('allow');
+  });
+});
+
+// ─── накопитель, не назвавшийся накопителем ──────────────────────────────────
+
+describe('опознание накопителя по SCSI-переносу', () => {
+  test('вендорский класс с SCSI Bulk-Only считается накопителем', () => {
+    expect(effectiveClass('ff:06:50')).toBe('08');
+    expect(effectiveClass('ff:06:62')).toBe('08');   // UAS
+  });
+
+  test('вендорский класс без SCSI-переноса остаётся вендорским', () => {
+    expect(effectiveClass('ff:ff:ff')).toBe('ff');
+    expect(effectiveClass('ff')).toBe('ff');
+  });
+
+  test('картридер попадает в категорию накопителей, а не «вне категорий»', () => {
+    expect(categoriesOf(['ff:06:50'])).toEqual(['storage']);
+  });
+
+  test('и подчиняется её галочке в обе стороны', () => {
+    const reader: UsbDevice = {
+      port: '1-12', target: 'allow', deviceId: '0bda:0129', name: '', serial: '',
+      interfaces: ['ff:06:50'], categories: ['storage'], uncategorized: false,
+    };
+    expect(allowedByCategories(reader, new Set(['storage']))).toBe(true);
+    expect(allowedByCategories(reader, new Set())).toBe(false);
+    expect(explainPolicy(reader, new Set())).toContain('Накопители');
+  });
+});
+
+describe('версия политики', () => {
+  test('свежая политика не считается устаревшей', () => {
+    expect(appliedVersion(generatePolicy(policy()))).toBe(CURRENT_POLICY_VERSION);
+  });
+
+  test('файл без отметки версии считается устаревшим', () => {
+    const old = generatePolicy(policy()).split('\n')
+      .filter(l => !l.startsWith('# redos-device-control-version:')).join('\n');
+    expect(appliedVersion(old)).toBe(0);
+  });
+
+  test('чужой файл версии не имеет', () => {
+    expect(appliedVersion('ALLOWED_CLASSES=03\n')).toBe(0);
   });
 });
 

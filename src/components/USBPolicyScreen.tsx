@@ -322,6 +322,20 @@ export function USBPolicyScreen({ onExit }: Props) {
         </Box>
       )}
 
+      {st.outdated && (
+        <Box flexDirection="column" marginBottom={1}>
+          <Box paddingLeft={2}>
+            <Text color="yellow">! </Text>
+            <Text color="yellow">Политика записана прошлой версией утилиты</Text>
+          </Box>
+          <Box paddingLeft={4}>
+            <Text color="gray" dimColor>
+              Примените заново: на машине лежат старые скрипт и правило — без рубежа по блочному узлу
+            </Text>
+          </Box>
+        </Box>
+      )}
+
       {st.conflicts.length > 0 && (
         <Box flexDirection="column" marginBottom={1}>
           <Box paddingLeft={2}>
