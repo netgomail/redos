@@ -18,7 +18,7 @@ export const COMMANDS: CommandDef[] = [
   { name: '/inventory',     description: 'инвентаризация системы', usage: '/inventory [файл.txt]', showInTips: true },
   { name: '/passwd-policy', description: 'парольная политика — сложность и срок смены', showInTips: true },
   { name: '/printer',       description: 'печать и сканирование — лечение очереди, только один МФУ', showInTips: true },
-  { name: '/usb-policy',    description: 'блокировка USB-накопителей и список доверенных', showInTips: true },
+  { name: '/usb-policy',    description: 'контроль USB-устройств: категории и исключения', showInTips: true },
   { name: '/quit',          description: 'завершить работу' },
 ];
 

@@ -3,13 +3,13 @@ import { Box, Text, useInput, useStdout } from 'ink';
 import { Spinner } from './Spinner';
 import {
   CATEGORIES, SELECTABLE_CATEGORIES, LOCKED_CATEGORIES,
-  readStatus, listDevices, install, applyPolicy, removePolicy, removeLegacyUdev,
-  readAppliedPolicy, describeDevice, describeInterfaces, describeKind, describeSize,
-  allowedByCategories,
-} from '../features/usbGuard';
+  readStatus, listDevices, applyPolicy, removePolicy, disableConflictingRules,
+  describeDevice, describeKind, describeSize, allowedByCategories,
+} from '../features/deviceControl';
 import type {
-  CategoryId, GuardStatus, GuardDevice, TrustedDevice,
-} from '../features/usbGuard';
+  CategoryId, PolicyStatus, UsbDevice, TrustedDevice,
+} from '../features/deviceControl';
+import { cleanupUsbGuard, hasTraces } from '../features/usbGuardLegacy';
 
 interface Props {
   onExit: () => void;
@@ -17,7 +17,6 @@ interface Props {
 
 type Phase =
   | 'loading'
-  | 'absent'    // usbguard не установлен
   | 'view'
   | 'running'
   | 'result';
@@ -27,7 +26,7 @@ type Focus = 'categories' | 'devices' | 'actions';
 /** Сколько строк устройств показывать разом. */
 const DEV_ROWS = 8;
 
-type ActionId = 'apply' | 'legacy' | 'remove' | 'refresh';
+type ActionId = 'apply' | 'usbguard' | 'conflicts' | 'remove' | 'refresh';
 interface Action { id: ActionId; title: string; hint: string }
 
 export function USBPolicyScreen({ onExit }: Props) {
@@ -35,13 +34,13 @@ export function USBPolicyScreen({ onExit }: Props) {
   const width = stdout?.columns ?? 80;
 
   const [phase,   setPhase]   = useState<Phase>('loading');
-  const [status,  setStatus]  = useState<GuardStatus | null>(null);
-  const [devices, setDevices] = useState<GuardDevice[]>([]);
+  const [status,  setStatus]  = useState<PolicyStatus | null>(null);
+  const [devices, setDevices] = useState<UsbDevice[]>([]);
 
   // Выбираемые категории. Всегда разрешённые (LOCKED_CATEGORIES) сюда не
   // попадают — их добавляет генератор правил.
   const [allowed, setAllowed] = useState<Set<CategoryId>>(new Set());
-  const [trusted, setTrusted] = useState<Set<string>>(new Set()); // ключ — hash или id:serial
+  const [trusted, setTrusted] = useState<Set<string>>(new Set()); // ключ — id:serial
   /**
    * Поимённые разрешения из уже применённой политики. Нужны, чтобы показать
    * их устройства в списке, даже если они сейчас не подключены: иначе
@@ -74,14 +73,14 @@ export function USBPolicyScreen({ onExit }: Props) {
    * портах. Показываем их наравне с подключёнными, иначе исключение пропало бы
    * незаметно для администратора.
    */
-  const offlineTrusted: GuardDevice[] = appliedTrusted
-    .filter(t => !devices.some(d => keyOf(d) === (t.hash || `${t.deviceId}:${t.serial}`)))
+  const offlineTrusted: UsbDevice[] = appliedTrusted
+    .filter(t => !devices.some(d => keyOf(d) === `${t.deviceId}:${t.serial}`))
     .map(t => ({
-      id: -1, target: 'block' as const,
-      deviceId: t.deviceId, name: t.name, serial: t.serial, hash: t.hash,
-      viaPort: '', interfaces: [], categories: [], uncategorized: true,
+      port: '', target: 'block' as const,
+      deviceId: t.deviceId, name: t.name, serial: t.serial,
+      interfaces: [], categories: [], uncategorized: true,
       offline: true,
-    } as GuardDevice & { offline: true }));
+    } as UsbDevice & { offline: true }));
 
   const managedDevices = [...connectedBlocked, ...offlineTrusted];
 
@@ -90,7 +89,6 @@ export function USBPolicyScreen({ onExit }: Props) {
     const st = await readStatus();
     if (!alive.current) return;
     setStatus(st);
-    if (!st.installed) { setPhase('absent'); return; }
 
     const devs = await listDevices();
     if (!alive.current) return;
@@ -99,7 +97,7 @@ export function USBPolicyScreen({ onExit }: Props) {
 
     // Восстанавливаем текущий выбор из того, что реально разрешено сейчас:
     // если политика уже наша, показываем её состояние, а не умолчания.
-    const applied = st.managed ? readAppliedPolicy() : null;
+    const applied = st.applied;
     if (applied) {
       // Читаем сами правила, а не список подключённых устройств: если веб-камера
       // сейчас не воткнута, категория всё равно разрешена, и галочка должна стоять.
@@ -108,7 +106,7 @@ export function USBPolicyScreen({ onExit }: Props) {
       // Отметки показывают действующую политику: устройство, разрешённое
       // исключением, обязано выглядеть отмеченным. Иначе выходит, что
       // сохранение не сработало, хотя правило в файле есть.
-      setTrusted(new Set(applied.trusted.map(t => t.hash || `${t.deviceId}:${t.serial}`)));
+      setTrusted(new Set(applied.trusted.map(t => `${t.deviceId}:${t.serial}`)));
     } else {
       // Первое включение: разрешено всё. Администратор снимает отметки с того,
       // что нужно заблокировать, и только после этого применяет. Так включение
@@ -123,15 +121,20 @@ export function USBPolicyScreen({ onExit }: Props) {
   useEffect(() => { refresh(); }, []);
 
   const actions: Action[] = [
-    { id: 'apply',   title: status?.managed ? 'Применить изменения' : 'Включить контроль устройств',
-      hint: 'записать правила, запустить usbguard и проверить, что ввод не отвалился' },
-    ...(status?.legacyUdev
-      ? [{ id: 'legacy' as ActionId, title: 'Убрать правила прошлой версии',
-           hint: `${status.legacyUdev.file} — udev-политика старого образца, она больше не действует` }]
+    { id: 'apply',   title: status?.active ? 'Применить изменения' : 'Включить контроль устройств',
+      hint: 'записать политику и правило udev, проверить, что устройства ввода не отвалились' },
+    ...(status && hasTraces(status.usbguard)
+      ? [{ id: 'usbguard' as ActionId, title: 'Убрать USBGuard прошлой версии',
+           hint: 'остановить службу, вернуть авторизацию устройствам и контроллерам, удалить пакет' }]
       : []),
-    ...(status?.managed || status?.serviceActive
+    ...(status?.conflicts.length
+      ? [{ id: 'conflicts' as ActionId,
+           title: `Отключить чужие USB-правила (${status.conflicts.length})`,
+           hint: 'переименовать чужие udev-правила: они применяются вместе с нашим и блокируют разрешённое' }]
+      : []),
+    ...(status?.active
       ? [{ id: 'remove' as ActionId, title: 'Снять контроль устройств',
-           hint: 'остановить usbguard и вернуть авторизацию всем устройствам' }]
+           hint: 'удалить правило и вернуть авторизацию всем устройствам' }]
       : []),
     { id: 'refresh', title: 'Обновить', hint: 'перечитать состояние и список устройств' },
   ];
@@ -147,25 +150,22 @@ export function USBPolicyScreen({ onExit }: Props) {
     setPhase('result');
   };
 
-  const doInstall = async () => {
-    startRun('Установка usbguard');
-    const r = await install(step);
-    finish(r.ok, 'Установка usbguard', [r.msg]);
+  const doCleanupGuard = async () => {
+    startRun('Удаление USBGuard');
+    const r = await cleanupUsbGuard(step);
+    finish(r.ok, 'USBGuard прошлой версии', r.msg.split('\n'));
+  };
+
+  const doConflicts = () => {
+    const r = disableConflictingRules(status?.conflicts ?? []);
+    finish(r.ok, 'Чужие USB-правила', [r.msg]);
   };
 
   const buildTrusted = (): TrustedDevice[] => {
     // Ровно то, что отмечено на экране, — ни больше, ни меньше
-    const out: TrustedDevice[] = managedDevices
+    return managedDevices
       .filter(d => trusted.has(keyOf(d)))
-      .map(d => ({ deviceId: d.deviceId, serial: d.serial, name: describeDevice(d), hash: d.hash }));
-
-    // Устройства из старой udev-политики: хеша у них нет, опознаём по id+serial
-    for (const a of status?.legacyUdev?.allowed ?? []) {
-      const id = `${a.vendor}:${a.product}`;
-      if (out.some(t => t.deviceId === id && t.serial === a.serial)) continue;
-      out.push({ deviceId: id, serial: a.serial, name: a.label ?? 'из прошлой политики', hash: '' });
-    }
-    return out;
+      .map(d => ({ deviceId: d.deviceId, serial: d.serial, name: describeDevice(d) }));
   };
 
   const doApply = async () => {
@@ -180,22 +180,13 @@ export function USBPolicyScreen({ onExit }: Props) {
     finish(r.ok, 'Контроль устройств', [r.msg]);
   };
 
-  const doLegacy = () => {
-    const r = removeLegacyUdev();
-    finish(r.ok, 'Правила прошлой версии', [
-      r.msg,
-      ...(status?.legacyUdev?.allowed.length
-        ? ['', `Доверенные устройства из неё (${status.legacyUdev.allowed.length}) перенесены в политику USBGuard.`]
-        : []),
-    ]);
-  };
-
   const runAction = (a: Action) => {
     switch (a.id) {
-      case 'apply': doApply(); break;
-      case 'legacy':  doLegacy(); break;
-      case 'remove':  doRemove(); break;
-      case 'refresh': refresh();  break;
+      case 'apply':     doApply(); break;
+      case 'usbguard':  doCleanupGuard(); break;
+      case 'conflicts': doConflicts(); break;
+      case 'remove':    doRemove(); break;
+      case 'refresh':   refresh();  break;
     }
   };
 
@@ -207,12 +198,6 @@ export function USBPolicyScreen({ onExit }: Props) {
     const k = (c: string) => !key.ctrl && !key.meta && char.toLowerCase() === c;
 
     if (phase === 'result') { if (k('q') || key.escape || key.return) refresh(); return; }
-
-    if (phase === 'absent') {
-      if (k('q') || key.escape) { onExit(); return; }
-      if (key.return) doInstall();
-      return;
-    }
 
     // phase === 'view'
     if (k('q') || key.escape) { onExit(); return; }
@@ -264,7 +249,7 @@ export function USBPolicyScreen({ onExit }: Props) {
   if (phase === 'loading') {
     return (
       <Frame width={width} subtitle="чтение состояния">
-        <Box paddingLeft={3}><Spinner /><Text color="gray"> Опрашиваю usbguard...</Text></Box>
+        <Box paddingLeft={3}><Spinner /><Text color="gray"> Читаю устройства и политику...</Text></Box>
       </Frame>
     );
   }
@@ -300,22 +285,6 @@ export function USBPolicyScreen({ onExit }: Props) {
     );
   }
 
-  if (phase === 'absent') {
-    return (
-      <Frame width={width} subtitle="usbguard не установлен">
-        <Box flexDirection="column" paddingLeft={3} marginBottom={1}>
-          <Text>Контроль устройств работает на USBGuard — он запрещает устройства</Text>
-          <Text>на уровне ядра: неавторизованная флешка не создаёт /dev/sdX,</Text>
-          <Text>и смонтировать её не сможет даже root.</Text>
-          <Text> </Text>
-          <Text color="gray">Пакет есть в штатном репозитории РЕД ОС:</Text>
-          <Text color="cyan">  dnf install usbguard</Text>
-        </Box>
-        <Box paddingLeft={2}><Text color="gray" dimColor>Enter — установить · Q/Esc — выход</Text></Box>
-      </Frame>
-    );
-  }
-
   // ── основной экран ──────────────────────────────────────────────────────────
 
   const st = status!;
@@ -325,19 +294,44 @@ export function USBPolicyScreen({ onExit }: Props) {
     devIdx - Math.floor(DEV_ROWS / 2),
     managedDevices.length - DEV_ROWS));
   const subtitle = [
-    st.version || 'usbguard',
-    st.serviceActive ? (st.managed ? 'политика redos активна' : 'работает чужая политика') : 'демон остановлен',
+    'udev',
+    st.active ? 'политика активна' : 'контроль выключен',
     `устройств: ${devices.length}${blocked ? `, заблокировано ${blocked}` : ''}`,
   ].join(' · ');
 
   return (
     <Frame width={width} subtitle={subtitle}>
-      {st.legacyUdev && (
-        <Box paddingLeft={2} marginBottom={1}>
-          <Text color="yellow">! </Text>
-          <Text color="yellow">
-            Найдены правила прошлой версии ({st.legacyUdev.allowed.length} доверенных) — они больше не действуют
-          </Text>
+      {hasTraces(st.usbguard) && (
+        <Box flexDirection="column" marginBottom={1}>
+          <Box paddingLeft={2}>
+            <Text color="yellow">! </Text>
+            <Text color="yellow">
+              {'На машине остался USBGuard — движок прошлой версии' +
+                (st.usbguard.serviceActive ? ' (служба работает)' : '') +
+                (st.usbguard.lockedControllers.length
+                  ? `, контроллеров без автоавторизации: ${st.usbguard.lockedControllers.length}`
+                  : '')}
+            </Text>
+          </Box>
+          <Box paddingLeft={4}>
+            <Text color="gray" dimColor>
+              Уберите его действием ниже: иначе он продолжит блокировать устройства мимо этой политики
+            </Text>
+          </Box>
+        </Box>
+      )}
+
+      {st.conflicts.length > 0 && (
+        <Box flexDirection="column" marginBottom={1}>
+          <Box paddingLeft={2}>
+            <Text color="yellow">! </Text>
+            <Text color="yellow">Чужие udev-правила по USB: {st.conflicts.join(', ')}</Text>
+          </Box>
+          <Box paddingLeft={4}>
+            <Text color="gray" dimColor>
+              Применяются вместе с нашим, RUN+= накапливается — чужое правило заблокирует и разрешённое устройство
+            </Text>
+          </Box>
         </Box>
       )}
 
@@ -376,9 +370,8 @@ export function USBPolicyScreen({ onExit }: Props) {
       {managedDevices.length === 0 ? (
         <Box paddingLeft={3}>
           <Text color="gray" dimColor>
-            {!st.serviceActive ? 'демон остановлен — список пуст'
-             : devices.length  ? 'выбранные категории пропускают всё, что сейчас подключено'
-             :                   'usbguard не отдал список'}
+            {devices.length ? 'выбранные категории пропускают всё, что сейчас подключено'
+                            : 'USB-устройств не найдено'}
           </Text>
         </Box>
       ) : <>
@@ -391,7 +384,7 @@ export function USBPolicyScreen({ onExit }: Props) {
         const tr  = trusted.has(keyOf(d));
         // Блочный узел важнее класса: картридер с вендорским классом — такой же
         // канал утечки, как флешка, и админ должен это видеть.
-        const offline = (d as GuardDevice & { offline?: boolean }).offline === true;
+        const offline = (d as UsbDevice & { offline?: boolean }).offline === true;
         const nodes = offline ? 'не подключено'
                     : d.storageNodes?.length ? d.storageNodes.map(n => '/dev/' + n).join(' ') : '—';
         const size  = describeSize(d);
@@ -459,9 +452,12 @@ export function USBPolicyScreen({ onExit }: Props) {
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
-/** Хеш дескриптора — самый надёжный ключ; если его нет, годится id+serial. */
-function keyOf(d: GuardDevice): string {
-  return d.hash || `${d.deviceId}:${d.serial}`;
+/**
+ * Ключ устройства. USBGuard давал хеш дескриптора, udev его не считает,
+ * поэтому опознаём по идентификатору и серийному номеру.
+ */
+function keyOf(d: UsbDevice): string {
+  return `${d.deviceId}:${d.serial}`;
 }
 
 function truncate(s: string, n: number): string {
