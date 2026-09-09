@@ -15,9 +15,9 @@ import { join } from 'path';
 import {
   CATEGORIES, TOKEN_DEVICE_IDS, LOCKED_CATEGORIES,
   generatePolicy, generateRules, parseAppliedPolicy, validatePolicyInput,
-  allowedByCategories, categoriesOf, BLOCK_SCRIPT_BODY,
+  allowedByCategories, categoriesOf, BLOCK_SCRIPT_BODY, portsToReauthorize,
 } from './deviceControl';
-import type { UsbDevice, PolicyInput } from './deviceControl';
+import type { UsbDevice, PolicyInput, UsbSysfsDevice } from './deviceControl';
 
 const policy = (over: Partial<PolicyInput> = {}): PolicyInput =>
   ({ allowed: [], trusted: [], ...over });
@@ -152,6 +152,8 @@ interface ScriptCase {
   vendor?:  string;
   product?: string;
   serial?:  string;
+  /** Состояние authorized до прогона. По умолчанию устройство разрешено. */
+  authorized?: '0' | '1';
 }
 
 function decide(opts: ScriptCase): 'allow' | 'block' {
@@ -160,7 +162,7 @@ function decide(opts: ScriptCase): 'allow' | 'block' {
     const port = '2-4';
     const dev  = join(root, 'sys/devices/pci0000:00/usb2', port);
     mkdirSync(dev, { recursive: true });
-    writeFileSync(join(dev, 'authorized'), '1');
+    writeFileSync(join(dev, 'authorized'), opts.authorized ?? '1');
     writeFileSync(join(dev, 'idVendor'),  opts.vendor  ?? '24a9');
     writeFileSync(join(dev, 'idProduct'), opts.product ?? '205a');
     writeFileSync(join(dev, 'serial'),    opts.serial  ?? '89880401');
@@ -246,6 +248,53 @@ describe('скрипт решения', () => {
 
   test('без файла политики скрипт ничего не блокирует', () => {
     expect(decide({ interfaces: ['08'], policyText: '' })).toBe('allow');
+  });
+});
+
+// ─── возврат авторизации ─────────────────────────────────────────────────────
+
+/**
+ * Устройство, снятое с авторизации, теряет интерфейсы: ядро их не
+ * конфигурирует. Ровно в таком виде оно и лежит в sysfs, пока заблокировано.
+ */
+const blockedSysfs = (over: Partial<UsbSysfsDevice> = {}): UsbSysfsDevice => ({
+  port: '2-4', deviceId: '24a9:205a', serial: '89880401',
+  manufacturer: '', product: '', authorized: false,
+  interfaces: [], storage: [], ...over,
+});
+
+describe('возврат авторизации перед прогоном правил', () => {
+  test('снятая блокировка не действует, пока устройство не переавторизовано', () => {
+    // Такой набор — заблокированная флешка при политике, которая её уже
+    // разрешает. Правило висит на событии интерфейса, а интерфейсов нет:
+    // решение по устройству не принимается, и оно остаётся заблокированным.
+    expect(decide({
+      interfaces: [],
+      authorized: '0',
+      policyText: generatePolicy(policy({ allowed: ['storage'] })),
+    })).toBe('block');
+  });
+
+  test('после возврата авторизации разрешённое устройство проходит', () => {
+    expect(decide({
+      interfaces: ['08'],
+      authorized: '1',
+      policyText: generatePolicy(policy({ allowed: ['storage'] })),
+    })).toBe('allow');
+  });
+
+  test('переподнимаются только заблокированные устройства', () => {
+    const ports = portsToReauthorize([
+      blockedSysfs({ port: '2-4' }),
+      blockedSysfs({ port: '1-8', authorized: true, interfaces: ['03'] }),
+    ]);
+    expect(ports).toEqual(['2-4']);
+  });
+
+  test('корневые хабы не трогаются', () => {
+    // authorized на контроллере относится ко всей шине: запись в него ради
+    // одного устройства задела бы всё дерево.
+    expect(portsToReauthorize([blockedSysfs({ port: 'usb2' })])).toEqual([]);
   });
 });
 
