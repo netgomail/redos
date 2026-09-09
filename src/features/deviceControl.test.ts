@@ -287,7 +287,9 @@ describe('устройство вне категорий', () => {
     const d = blockedDevice({
       remembered: { model: '', kind: '', sizeBytes: 0, seen: '', interfaces: ['ff:ff:ff'] },
     });
-    expect(describeKind(d)).toBe('вне категорий: ff — вендорский');
+    // В колонке — только коды: расшифровка словами не влезает, а обрезанная
+    // не говорит ничего. Словами класс называет разбор под таблицей.
+    expect(describeKind(d)).toBe('вне категорий ff');
     expect(explainPolicy(d, new Set())).toContain('последнего подключения');
   });
 });
