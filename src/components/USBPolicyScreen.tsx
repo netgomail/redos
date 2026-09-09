@@ -5,6 +5,7 @@ import {
   CATEGORIES, SELECTABLE_CATEGORIES, LOCKED_CATEGORIES,
   readStatus, listDevices, applyPolicy, removePolicy, disableConflictingRules,
   describeDevice, describeKind, describeSize, allowedByCategories,
+  predictTarget, explainPolicy,
 } from '../features/deviceControl';
 import type {
   CategoryId, PolicyStatus, UsbDevice, TrustedDevice,
@@ -363,8 +364,8 @@ export function USBPolicyScreen({ onExit }: Props) {
       <Box paddingLeft={2}>
         <Text color="gray" dimColor>
           {/* ширины те же, что у строк ниже, иначе колонки разъедутся */}
-          {'  ' + '    ' + 'статус'.padEnd(11) + 'ид.'.padEnd(10) + ' ' +
-           'устройство'.padEnd(26) + 'тип'.padEnd(17) + 'размер ~'.padEnd(11) + 'узел'}
+          {'  ' + '    ' + 'статус'.padEnd(14) + 'ид.'.padEnd(10) + ' ' +
+           'устройство'.padEnd(24) + 'тип'.padEnd(17) + 'размер ~'.padEnd(11) + 'узел'}
         </Text>
       </Box>
       {managedDevices.length === 0 ? (
@@ -392,6 +393,7 @@ export function USBPolicyScreen({ onExit }: Props) {
         // не-накопителей вместо типа показываем категорию, а для устройств
         // вне категорий — классы интерфейсов словами.
         const kind = describeKind(d);
+        const st2  = rowStatus(d, tr, offline, allowed);
         return (
           <Box key={keyOf(d) + i} paddingLeft={2}>
             <Text color={cur ? 'white' : 'gray'}>{cur ? '❯ ' : '  '}</Text>
@@ -400,11 +402,9 @@ export function USBPolicyScreen({ onExit }: Props) {
                 без красного креста: оно не «запрещено этим списком», а всего
                 лишь не внесено в исключения. */}
             <Text color={tr ? 'green' : 'gray'} bold={tr}>{tr ? '[✓] ' : '[ ] '}</Text>
-            <Text color={tr ? 'green' : 'gray'} dimColor={!tr}>
-              {(tr ? 'разрешено' : '').padEnd(11)}
-            </Text>
+            <Text color={st2.color} dimColor={st2.dim}>{st2.text.padEnd(14)}</Text>
             <Text color={cur ? 'white' : 'gray'} bold={cur}>
-              {(d.deviceId || '—').padEnd(10)} {truncate(describeDevice(d), 25).padEnd(26)}
+              {(d.deviceId || '—').padEnd(10)} {truncate(describeDevice(d), 23).padEnd(24)}
             </Text>
             <Text color={d.uncategorized ? 'yellow' : 'gray'} dimColor={!d.uncategorized}>
               {truncate(kind, 16).padEnd(17)}
@@ -421,6 +421,16 @@ export function USBPolicyScreen({ onExit }: Props) {
       {devStart + DEV_ROWS < managedDevices.length && (
         <Box paddingLeft={4}>
           <Text color="gray" dimColor>↓ ниже ещё {managedDevices.length - devStart - DEV_ROWS}</Text>
+        </Box>
+      )}
+      {/* Разбор по выделенному устройству. В колонках всё обрезано по ширине,
+          а именно здесь ответ на вопрос «почему оно заблокировано»: какой
+          класс не прошёл и включается ли он галочкой вообще. */}
+      {managedDevices[devIdx] && (
+        <Box paddingLeft={4} marginTop={1}>
+          <Text color="gray" dimColor>
+            {truncate(explainPolicy(managedDevices[devIdx]!, allowed), Math.max(20, width - 10))}
+          </Text>
         </Box>
       )}
       </>}
@@ -458,6 +468,37 @@ export function USBPolicyScreen({ onExit }: Props) {
  */
 function keyOf(d: UsbDevice): string {
   return `${d.deviceId}:${d.serial}`;
+}
+
+/**
+ * Колонка «статус»: что с устройством сейчас и что с ним станет.
+ *
+ * Раньше здесь стояло «разрешено» у отмеченных и пустота у всех остальных —
+ * то есть на главный вопрос, заблокировано устройство прямо сейчас или нет,
+ * колонка не отвечала вовсе. Теперь показывается состояние из ядра, а когда
+ * невыполненный выбор его меняет — со стрелкой: решение принято, но политика
+ * ещё не применена.
+ */
+function rowStatus(
+  d: UsbDevice,
+  trusted: boolean,
+  offline: boolean,
+  allowed: Set<CategoryId>,
+): { text: string; color: 'green' | 'red' | 'yellow'; dim: boolean } {
+  // Устройства нет в портах: состояние в ядре про него ничего не говорит.
+  if (offline) return { text: trusted ? 'разрешено' : '', color: 'green', dim: !trusted };
+
+  const now  = d.target;
+  const want = predictTarget(d, allowed, trusted);
+
+  if (want === 'unknown' || want === now) {
+    return now === 'allow'
+      ? { text: 'разрешено',     color: 'green', dim: false }
+      : { text: 'заблокировано', color: 'red',   dim: false };
+  }
+  return want === 'allow'
+    ? { text: '→ разрешить',   color: 'yellow', dim: false }
+    : { text: '→ блокировать', color: 'yellow', dim: false };
 }
 
 function truncate(s: string, n: number): string {

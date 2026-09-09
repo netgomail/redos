@@ -34,7 +34,7 @@
  * подняться и деавторизуется через доли секунды.
  */
 
-import { readdirSync, realpathSync, existsSync } from 'fs';
+import { readdirSync, realpathSync, existsSync, readFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { readFile } from '../utils/fs';
 import { joinScsiName } from '../utils/scsi';
@@ -359,11 +359,85 @@ export function describeKind(d: UsbDevice): string {
     if (disk.sizeBytes) return disk.kind;
     return disk.kind === 'картридер' ? 'картридер (нет карты)' : `${disk.kind} (пусто)`;
   }
-  if (d.remembered) return d.remembered.kind;
-  if (d.categories.length) {
-    return CATEGORIES.find(c => c.id === d.categories[0])?.title ?? d.categories[0];
+  if (d.remembered?.kind) return d.remembered.kind;
+
+  // У заблокированного устройства живых интерфейсов нет — берём заявленные.
+  const { interfaces: ifaces } = interfacesOf(d);
+  const cats = d.interfaces.length ? d.categories : categoriesOf(ifaces, d.deviceId);
+  if (cats.length) {
+    return CATEGORIES.find(c => c.id === cats[0])?.title ?? cats[0];
   }
-  return `вне категорий: ${describeInterfaces(d.interfaces)}`;
+  // Пустой список классов — не «ни в одну категорию не попал», а «сказать
+  // нечего»: устройство заблокировано и ни разу не виделось разрешённым.
+  if (ifaces.length === 0) return 'классы не видны';
+  return `вне категорий: ${describeInterfaces(ifaces)}`;
+}
+
+/**
+ * Классы интерфейсов устройства и откуда они взяты.
+ *
+ * Порядок источников — по убыванию достоверности:
+ *  live       — ядро сконфигурировало интерфейсы, ровно по ним решает политика;
+ *  declared   — дескрипторы самого устройства; есть и у заблокированного,
+ *               но это его собственные слова, а не проверенный факт;
+ *  remembered — что было видно при последнем подключении; устройство с тех
+ *               пор могли подменить.
+ *
+ * Источник важен не меньше самих классов: показывать заявленное как
+ * действующее — значит выдавать слова устройства за решение системы.
+ */
+export type InterfaceSource = 'live' | 'declared' | 'remembered' | 'none';
+
+export function interfacesOf(d: UsbDevice): { interfaces: string[]; source: InterfaceSource } {
+  if (d.interfaces.length)          return { interfaces: d.interfaces, source: 'live' };
+  if (d.sysfs?.declared?.length)    return { interfaces: d.sysfs.declared, source: 'declared' };
+  if (d.remembered?.interfaces?.length)
+    return { interfaces: d.remembered.interfaces, source: 'remembered' };
+  return { interfaces: [], source: 'none' };
+}
+
+/** Оговорка к данным не из ядра — чтобы заявленное не читалось как факт. */
+const SOURCE_NOTE: Record<InterfaceSource, string> = {
+  live:       '',
+  declared:   ' (со слов устройства: оно заблокировано и ядром не опрошено)',
+  remembered: ' (по данным последнего подключения)',
+  none:       '',
+};
+
+/**
+ * Почему устройство не проходит по категориям — словами, для строки деталей.
+ *
+ * Повторяет разбор из allowedByCategories, но вместо «да/нет» называет
+ * виновный класс: администратору нужно знать, какую категорию включить, а
+ * когда включать нечего — что путь один, поимённое исключение.
+ */
+export function explainPolicy(d: UsbDevice, allowed: Set<CategoryId>): string {
+  const { interfaces: ifaces, source } = interfacesOf(d);
+  if (ifaces.length === 0) {
+    return 'классы интерфейсов не видны: ядро не конфигурирует их у заблокированного устройства';
+  }
+
+  const active = CATEGORIES.filter(c => c.locked || allowed.has(c.id));
+  const isStorage = ifaces.some(i => i.split(':')[0].toLowerCase() === STORAGE_CLASS);
+  if (!isStorage && active.some(c => c.ids?.some(pat => idMatches(d.deviceId, pat)))) {
+    return 'разрешено по идентификатору: криптотокен';
+  }
+
+  const stale = SOURCE_NOTE[source];
+  const problems: string[] = [];
+  for (const cls of new Set(ifaces.map(i => i.split(':')[0].toLowerCase()))) {
+    if (active.some(c => c.classes.some(p => p.split(':')[0].toLowerCase() === cls))) continue;
+    const name = `${cls} — ${CLASS_NAMES[cls] ?? 'неизвестный класс'}`;
+    // Класс, который вообще не покрыт категориями, включением галочки не
+    // разрешить: для него есть только поимённое исключение.
+    const owner = CATEGORIES.find(c => c.classes.some(p => p.split(':')[0].toLowerCase() === cls));
+    problems.push(owner
+      ? `${name}: категория «${owner.title}» выключена`
+      : `${name}: ни одна категория его не покрывает — только поимённо`);
+  }
+
+  if (problems.length === 0) return `все интерфейсы разрешены категориями${stale}`;
+  return problems.join('; ') + stale;
 }
 
 // ─── чтение sysfs ────────────────────────────────────────────────────────────
@@ -385,6 +459,18 @@ export interface UsbSysfsDevice {
   authorized:   boolean;
   /** Классы интерфейсов в виде «08:06:50» — то же представление, что у USBGuard. */
   interfaces:   string[];
+  /**
+   * Классы из дескрипторов, заявленных самим устройством.
+   *
+   * Читаются из sysfs-файла descriptors, который остаётся на месте и у
+   * деавторизованного устройства, — в отличие от каталогов интерфейсов, за
+   * которыми стоит уже сконфигурированное ядром. Это единственный способ
+   * сказать про заблокированное устройство, что оно вообще такое.
+   *
+   * Решение по ним не принимается: заявленному верить нельзя, политику
+   * применяет скрипт по тому, что ядро действительно сконфигурировало.
+   */
+  declared:     string[];
   storage:      UsbStorageNode[];
 }
 
@@ -477,6 +563,42 @@ function readInterfaces(dir: string, port: string): string[] {
   return out;
 }
 
+/**
+ * Классы интерфейсов из дескрипторов устройства.
+ *
+ * Файл descriptors — сырой дамп: сначала дескриптор устройства, затем
+ * конфигурации, а внутри них — интерфейсы. Каждая запись начинается с длины и
+ * типа, так что перебор идёт по длинам, без разбора незнакомых типов.
+ *
+ * Берётся только первая конфигурация и только основная альтернатива каждого
+ * интерфейса: ядро конфигурирует именно их, и сравнение должно идти с тем же
+ * набором, что попадёт в sysfs после авторизации.
+ */
+function declaredInterfaces(dir: string): string[] {
+  let buf: Buffer;
+  try { buf = readFileSync(join(dir, 'descriptors')); } catch { return []; }
+
+  const DESC_CONFIG = 0x02, DESC_INTERFACE = 0x04;
+  const out: string[] = [];
+  const seen = new Set<string>();
+  let configs = 0;
+
+  for (let i = 0; i + 1 < buf.length; ) {
+    const len = buf[i]!;
+    if (len < 2) break;                       // мусор: дальше не разобрать
+    const type = buf[i + 1]!;
+    if (type === DESC_CONFIG && ++configs > 1) break;
+    // i+3 — bAlternateSetting, i+5..7 — класс, подкласс, протокол
+    if (type === DESC_INTERFACE && i + 7 < buf.length && buf[i + 3] === 0) {
+      const key = [buf[i + 5]!, buf[i + 6]!, buf[i + 7]!]
+        .map(v => v.toString(16).padStart(2, '0')).join(':');
+      if (!seen.has(key)) { seen.add(key); out.push(key); }
+    }
+    i += len;
+  }
+  return out;
+}
+
 export function listUsbSysfs(): UsbSysfsDevice[] {
   const blocks = usbBlockNodes();
   const out: UsbSysfsDevice[] = [];
@@ -497,6 +619,7 @@ export function listUsbSysfs(): UsbSysfsDevice[] {
       product:      sysRead(join(dir, 'product')),
       authorized:   sysRead(join(dir, 'authorized')) === '1',
       interfaces:   readInterfaces(dir, port),
+      declared:     declaredInterfaces(dir),
       storage:      blocks.get(real) ?? [],
     });
   }
@@ -560,11 +683,11 @@ export async function listDevices(): Promise<UsbDevice[]> {
       };
     });
 
-  // Запоминаем размеры разрешённых и подставляем запомненное заблокированным
+  // Запоминаем, что видно у разрешённых, и подставляем запомненное заблокированным
   saveRemembered(devices);
   const cache = loadRemembered();
   for (const d of devices) {
-    if (d.sysfs?.storage?.length) continue;
+    if (d.sysfs?.storage?.length && d.interfaces.length) continue;
     const r = cache[rememberKey(d)];
     if (r) d.remembered = r;
   }
@@ -579,6 +702,15 @@ export interface RememberedDevice {
   kind:      string;
   sizeBytes: number;
   seen:      string;   // ISO-дата последнего подключения
+  /**
+   * Классы интерфейсов, какими они были при последнем подключении.
+   *
+   * Заблокированное устройство их не показывает — ядро не конфигурирует
+   * интерфейсы, пока не разрешена авторизация. Без памяти о них колонка типа
+   * у заблокированного устройства говорила «вне категорий:» с пустым списком,
+   * то есть ровно наоборот: будто классы известны и ни во что не попали.
+   */
+  interfaces?: string[];
 }
 
 /**
@@ -607,13 +739,24 @@ function saveRemembered(devices: UsbDevice[]): void {
   const cache = loadRemembered();
   let changed = false;
   for (const d of devices) {
+    // Запоминать нечего, пока устройство заблокировано: ни интерфейсов, ни
+    // носителя оно не показывает, и запись затёрла бы то, что уже известно.
+    if (d.interfaces.length === 0) continue;
     const disk = d.sysfs?.storage?.[0];
-    if (!disk || !disk.sizeBytes) continue;
-    const model = disk.fullName;
+    const model = disk?.fullName ?? '';
     const key = rememberKey(d);
     const prev = cache[key];
-    if (prev && prev.sizeBytes === disk.sizeBytes && prev.model === model) continue;
-    cache[key] = { model, kind: disk.kind, sizeBytes: disk.sizeBytes, seen: new Date().toISOString() };
+    const next: RememberedDevice = {
+      model:     model || prev?.model || '',
+      kind:      disk?.sizeBytes ? disk.kind : (prev?.kind ?? ''),
+      sizeBytes: disk?.sizeBytes || prev?.sizeBytes || 0,
+      seen:      new Date().toISOString(),
+      interfaces: d.interfaces,
+    };
+    if (prev && prev.model === next.model && prev.kind === next.kind &&
+        prev.sizeBytes === next.sizeBytes &&
+        (prev.interfaces ?? []).join() === next.interfaces!.join()) continue;
+    cache[key] = next;
     changed = true;
   }
   if (!changed) return;
@@ -641,6 +784,27 @@ export function allowedByCategories(d: UsbDevice, allowed: Set<CategoryId>): boo
   if (d.interfaces.length === 0) return false;
   const classes = new Set(active.flatMap(c => c.classes).map(p => p.split(':')[0].toLowerCase()));
   return d.interfaces.every(i => classes.has(i.split(':')[0].toLowerCase()));
+}
+
+/**
+ * Каким станет устройство, когда политика будет применена.
+ *
+ * Отличается от allowedByCategories тем, что смотрит и на запомненные классы:
+ * та повторяет семантику правил и решает по живым интерфейсам, а у
+ * заблокированного устройства их нет — по ней всё заблокированное выглядело бы
+ * одинаково, и администратор не видел бы, что снятая галочка уже вернёт ему
+ * флешку. Отсюда и третий ответ: про устройство, которое ни разу не видели
+ * разрешённым, сказать заранее нечего.
+ */
+export function predictTarget(
+  d: UsbDevice,
+  allowed: Set<CategoryId>,
+  trusted: boolean,
+): 'allow' | 'block' | 'unknown' {
+  if (trusted) return 'allow';
+  const { interfaces } = interfacesOf(d);
+  if (interfaces.length === 0) return 'unknown';
+  return allowedByCategories({ ...d, interfaces }, allowed) ? 'allow' : 'block';
 }
 
 // ─── политика ────────────────────────────────────────────────────────────────

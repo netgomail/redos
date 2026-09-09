@@ -16,6 +16,7 @@ import {
   CATEGORIES, TOKEN_DEVICE_IDS, LOCKED_CATEGORIES,
   generatePolicy, generateRules, parseAppliedPolicy, validatePolicyInput,
   allowedByCategories, categoriesOf, BLOCK_SCRIPT_BODY, portsToReauthorize,
+  predictTarget, explainPolicy, describeKind,
 } from './deviceControl';
 import type { UsbDevice, PolicyInput, UsbSysfsDevice } from './deviceControl';
 
@@ -251,6 +252,68 @@ describe('скрипт решения', () => {
   });
 });
 
+// ─── что видно про заблокированное устройство ────────────────────────────────
+
+/**
+ * Заблокированное устройство: интерфейсов нет, потому что ядро их не
+ * конфигурирует. Так оно и выглядит в sysfs.
+ */
+const blockedDevice = (over: Partial<UsbDevice> = {}): UsbDevice => ({
+  port: '1-4', target: 'block', deviceId: '2357:0109', name: '802.11n NIC',
+  serial: '', interfaces: [], categories: [], uncategorized: false, ...over,
+});
+
+describe('устройство вне категорий', () => {
+  test('вендорский класс не покрыт ни одной категорией — только поимённо', () => {
+    const dongle = blockedDevice({ interfaces: ['ff:ff:ff'], target: 'allow' });
+    expect(allowedByCategories(dongle, new Set(['network', 'wireless']))).toBe(false);
+    expect(explainPolicy(dongle, new Set(['network', 'wireless'])))
+      .toContain('ни одна категория его не покрывает');
+  });
+
+  test('выключенная категория названа по имени', () => {
+    const flash = blockedDevice({ interfaces: ['08:06:50'], target: 'allow' });
+    expect(explainPolicy(flash, new Set())).toContain('Накопители');
+  });
+
+  test('у заблокированного классы не выдумываются', () => {
+    // Пустой список интерфейсов — это «не видно», а не «ни во что не попал»:
+    // «вне категорий:» с пустым перечнем говорил ровно обратное.
+    expect(describeKind(blockedDevice())).toBe('классы не видны');
+    expect(explainPolicy(blockedDevice(), new Set())).toContain('не видны');
+  });
+
+  test('классы с последнего подключения подставляются с пометкой', () => {
+    const d = blockedDevice({
+      remembered: { model: '', kind: '', sizeBytes: 0, seen: '', interfaces: ['ff:ff:ff'] },
+    });
+    expect(describeKind(d)).toBe('вне категорий: ff — вендорский');
+    expect(explainPolicy(d, new Set())).toContain('последнего подключения');
+  });
+});
+
+describe('прогноз состояния', () => {
+  const flash = () => blockedDevice({
+    remembered: { model: '', kind: '', sizeBytes: 0, seen: '', interfaces: ['08:06:50'] },
+  });
+
+  test('разрешённая категория поднимет заблокированное устройство', () => {
+    expect(predictTarget(flash(), new Set(['storage']), false)).toBe('allow');
+  });
+
+  test('при выключенной категории останется заблокированным', () => {
+    expect(predictTarget(flash(), new Set(), false)).toBe('block');
+  });
+
+  test('поимённое исключение сильнее категорий', () => {
+    expect(predictTarget(flash(), new Set(), true)).toBe('allow');
+  });
+
+  test('про устройство без известных классов прогноза нет', () => {
+    expect(predictTarget(blockedDevice(), new Set(['storage']), false)).toBe('unknown');
+  });
+});
+
 // ─── возврат авторизации ─────────────────────────────────────────────────────
 
 /**
@@ -260,7 +323,7 @@ describe('скрипт решения', () => {
 const blockedSysfs = (over: Partial<UsbSysfsDevice> = {}): UsbSysfsDevice => ({
   port: '2-4', deviceId: '24a9:205a', serial: '89880401',
   manufacturer: '', product: '', authorized: false,
-  interfaces: [], storage: [], ...over,
+  interfaces: [], declared: [], storage: [], ...over,
 });
 
 describe('возврат авторизации перед прогоном правил', () => {
