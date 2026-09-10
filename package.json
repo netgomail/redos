@@ -4,7 +4,7 @@
   "main": "src/app.tsx",
   "dependencies": {
     "ink": "^7.1.1",
-    "react": "^19.2.8"
+    "react": "^19.3.0"
   },
   "description": "Консольная утилита для аудита безопасности Linux",
   "keywords": [
@@ -21,7 +21,7 @@
     "test": "bun test"
   },
   "devDependencies": {
-    "@types/react": "^19.2.18",
-    "bun-types": "^1.4.1"
+    "@types/react": "^19.3.0",
+    "bun-types": "^1.4.2"
   }
 }
