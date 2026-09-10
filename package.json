@@ -1,6 +1,6 @@
 {
   "name": "redos",
-  "version": "0.12.1",
+  "version": "0.13.0",
   "main": "src/app.tsx",
   "dependencies": {
     "ink": "^7.1.1",
