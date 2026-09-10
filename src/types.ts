@@ -6,4 +6,4 @@ export interface Message {
   content: string;
 }
 
-export type Screen = 'chat' | 'passwd-policy' | 'usb-policy' | 'printer';
+export type Screen = 'chat' | 'passwd-policy' | 'usb-policy' | 'printer' | 'install';

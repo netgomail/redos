@@ -15,6 +15,7 @@ export const COMMANDS: CommandDef[] = [
   { name: '/clear',         description: 'очистить историю' },
   { name: '/exit',          description: 'завершить работу' },
   { name: '/help',          description: 'показать список команд', showInTips: true },
+  { name: '/install',       description: 'установка сторонних программ (АС Смета и другие)', showInTips: true },
   { name: '/inventory',     description: 'инвентаризация системы', usage: '/inventory [файл.txt]', showInTips: true },
   { name: '/passwd-policy', description: 'парольная политика — сложность и срок смены', showInTips: true },
   { name: '/printer',       description: 'печать и сканирование — лечение очереди, только один МФУ', showInTips: true },
@@ -105,6 +106,13 @@ async function handleInventory(add: AddFn, arg: string) {
   }
 }
 
+function handleInstall(add: AddFn, openScreen: (s: Screen) => void) {
+  if (!linuxOnly(add, 'Установка программ')) return;
+  // Ставится в домашний каталог оператора — root не нужен, даже если сессия
+  // уже эскалирована другой командой.
+  openScreen('install');
+}
+
 async function handlePasswdPolicy(add: AddFn, openScreen: (s: Screen) => void, exit: () => void) {
   if (!linuxOnly(add, 'Парольная политика')) return;
   if (!await requireRoot(add, exit, 'Парольная политика', '/passwd-policy')) return;
@@ -137,6 +145,7 @@ export function useCommands(
       case '/quit':          exit(); break;
       case '/clear':         clear(); break;
       case '/help':          handleHelp(add); break;
+      case '/install':       handleInstall(add, openScreen); break;
       case '/inventory':     handleInventory(add, arg); break;
       case '/passwd-policy': handlePasswdPolicy(add, openScreen, exit); break;
       case '/printer':       handlePrinter(add, openScreen, exit); break;
