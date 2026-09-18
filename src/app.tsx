@@ -14,7 +14,7 @@ import {
 import { useMessages }    from './hooks/useMessages';
 import { useInputState }  from './hooks/useInputState';
 import { useCommands }    from './commands/index';
-import { checkLatestVersion, selfUpdate } from './utils/update';
+import { checkLatestVersion, selfUpdate, REPO } from './utils/update';
 import { version as VERSION } from '../package.json';
 import { setRestartHandler } from './utils/restart';
 import type { Screen } from './types';
@@ -204,17 +204,97 @@ function App({ autoCmd, initialError }: AppProps) {
 }
 
 // ─── CLI entry ────────────────────────────────────────────────────────────────
-// --auto-cmd <name> — внутренний флаг, который проставляет escalateViaPkexec
-// дочернему процессу, чтобы тот сам открыл нужный экран после повышения прав.
-const userArgs = process.argv.slice(2);
-let autoCmd: string | undefined;
-const idx = userArgs.indexOf('--auto-cmd');
-if (idx !== -1 && userArgs[idx + 1]) autoCmd = userArgs[idx + 1];
+// Ручной запуск обновления из шелла (`redos update`) — на случай, если
+// фоновая автопроверка ещё не сработала или недоступна сеть при старте.
+if (process.argv[2] === 'update') {
+  const ESC   = '\x1b';
+  const reset = `${ESC}[0m`;
+  const bold  = `${ESC}[1m`;
+  const dim   = `${ESC}[2m`;
+  const cyan  = `${ESC}[96m`;
+  const green = `${ESC}[92m`;
+  const red   = `${ESC}[91m`;
+  const gray  = `${ESC}[90m`;
 
-const startApp = (opts: AppProps = {}) => {
-  render(<App autoCmd={opts.autoCmd} initialError={opts.initialError} />);
-};
-// requireRoot вызывает restartApp, если pkexec был отменён, — Ink уже
-// разобран, поэтому пересоздаём дерево заново с уведомлением.
-setRestartHandler(msg => startApp({ initialError: msg }));
-startApp({ autoCmd });
+  // Прогресс-бар. Ровно тот же, что рисует install.sh при первой установке:
+  // ширина 22, заполненная часть зелёная, пустая серая. floor, а не round, —
+  // иначе бар выглядит полным ещё до конца загрузки (и расходится с install.sh).
+  const bar = (received: number, total: number, width = 22): string => {
+    if (total <= 0) return '';
+    const filled = Math.min(width, Math.floor((received / total) * width));
+    return `${dim}[${reset}${green}${'█'.repeat(filled)}${gray}${'░'.repeat(width - filled)}${dim}]${reset}`;
+  };
+
+  // Подкрашиваем версии: «vX.Y.Z → vA.B.C» — старая серая, стрелка cyan, новая зелёная жирная.
+  const colorVersions = (s: string) => /v\d+\.\d+\.\d+\s*→\s*v\d+\.\d+\.\d+/.test(s)
+    ? s.replace(/v(\d+\.\d+\.\d+)\s*→\s*v(\d+\.\d+\.\d+)/g,
+        `${gray}v$1${reset} ${cyan}→${reset} ${green}${bold}v$2${reset}`)
+    : s.replace(/v(\d+\.\d+\.\d+)/g, `${green}${bold}v$1${reset}`);
+
+  // ── Заголовок ─────────────────────────────────────────────────────────────
+  // Тот же вид, что у install.sh при первой установке: рамка, имя, версия, ссылка.
+  const headerLine = '+' + '-'.repeat(50) + '+';
+  process.stdout.write('\n');
+  process.stdout.write(`  ${cyan}${headerLine}${reset}\n`);
+  process.stdout.write(`  ${cyan}|${reset}  ${bold}РедОС${reset} Updater  ${gray}v${VERSION}${reset}\n`);
+  process.stdout.write(`  ${cyan}|${reset}  ${gray}https://github.com/${REPO}${reset}\n`);
+  process.stdout.write(`  ${cyan}${headerLine}${reset}\n`);
+  process.stdout.write('\n');
+
+  // ── Шаги и прогресс ───────────────────────────────────────────────────────
+  let progressActive = false;
+  const finishProgressLine = () => {
+    if (progressActive) {
+      // Курсор уже стоит на пустой строке под баром (см. progress ниже),
+      // поэтому достаточно одного перевода, чтобы следующий шаг не прилипал.
+      process.stdout.write('\n');
+      progressActive = false;
+    }
+  };
+  const step = (msg: string) => {
+    finishProgressLine();
+    process.stdout.write(`  ${cyan}›${reset} ${colorVersions(msg)}\n`);
+  };
+  const progress = (received: number, total: number) => {
+    const mb  = (n: number) => (n / 1024 / 1024).toFixed(1);
+    const pct = total > 0 ? Math.floor((received / total) * 100) : 0;
+    const text = total > 0
+      ? `Скачиваю ${bar(received, total)} ${bold}${pct.toString().padStart(3)}%${reset} ${dim}(${mb(received)} / ${mb(total)} MB)${reset}`
+      : `Скачиваю ${mb(received)} MB`;
+    // Бар живёт на своей строке, но курсор оставляем на пустой строке под ней:
+    // иначе к концу загрузки бар оказывается прижат к нижнему краю терминала.
+    // Отсюда «курсор вверх» перед каждой перерисовкой, кроме первой.
+    const up = progressActive ? `${ESC}[1A` : '';
+    process.stdout.write(`${up}\r  ${cyan}›${reset} ${text}${ESC}[K\n`);
+    progressActive = true;
+  };
+
+  const result = await selfUpdate(step, progress);
+  finishProgressLine();
+  process.stdout.write('\n');
+
+  // ── Итог без рамки: иконка + текст с подсветкой версий ────────────────────
+  const isError = result.startsWith('Ошибка');
+  const icon    = isError ? `${red}${bold}✗${reset}` : `${green}${bold}✓${reset}`;
+  result.split('\n').forEach((l, i) => {
+    const prefix = i === 0 ? `${icon} ` : '  ';
+    process.stdout.write(`  ${prefix}${colorVersions(l)}\n`);
+  });
+  process.stdout.write('\n');
+  process.exit(0);
+} else {
+  // --auto-cmd <name> — внутренний флаг, который проставляет escalateViaPkexec
+  // дочернему процессу, чтобы тот сам открыл нужный экран после повышения прав.
+  const userArgs = process.argv.slice(2);
+  let autoCmd: string | undefined;
+  const idx = userArgs.indexOf('--auto-cmd');
+  if (idx !== -1 && userArgs[idx + 1]) autoCmd = userArgs[idx + 1];
+
+  const startApp = (opts: AppProps = {}) => {
+    render(<App autoCmd={opts.autoCmd} initialError={opts.initialError} />);
+  };
+  // requireRoot вызывает restartApp, если pkexec был отменён, — Ink уже
+  // разобран, поэтому пересоздаём дерево заново с уведомлением.
+  setRestartHandler(msg => startApp({ initialError: msg }));
+  startApp({ autoCmd });
+}
