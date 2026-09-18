@@ -26,9 +26,9 @@ function App({ autoCmd, initialError }: AppProps) {
   const { exit } = useApp();
   const { messages, add, clear } = useMessages();
   const [screen, setScreen] = useState<Screen>('chat');
-  // Версия, до которой приложение само обновилось в этом сеансе (см. ниже).
-  // Пока не null — держит напоминание о перезапуске в шапке.
-  const [updatedTo, setUpdatedTo] = useState<string | null>(null);
+  // Статус автообновления для шапки: version — куда обновляемся, done — уже
+  // подменили бинарник и ждём перезапуска. null — обновление не идёт.
+  const [update, setUpdate] = useState<{ version: string; done: boolean } | null>(null);
 
   const {
     input, setInput,
@@ -57,20 +57,36 @@ function App({ autoCmd, initialError }: AppProps) {
 
   // Автообновление: один фоновой запрос при старте, без участия пользователя.
   // Если на GitHub есть более новая версия — сразу качаем и подменяем бинарник
-  // (rename, см. selfUpdate). Текущий процесс всё ещё работает со старым
-  // inode, поэтому просто оставляем заметное напоминание перезапустить —
-  // приложение не закрываем и работу не прерываем.
+  // (rename, см. selfUpdate), а в шапке всё время виден статус: пока идёт
+  // загрузка — спиннер и версия, после — зелёная надпись с просьбой
+  // перезапустить. Текущий процесс всё ещё работает со старым inode, но
+  // ничего не блокируем и не прерываем — чат продолжает работать как обычно.
   const ranUpdateRef = useRef(false);
   useEffect(() => {
     if (ranUpdateRef.current) return;
     ranUpdateRef.current = true;
     (async () => {
+      // REDOS_DEMO_UPDATE — локальный прогон анимации без сети и реальной
+      // подмены бинарника, чтобы смотреть на результат через `bun start`,
+      // не выпуская релиз ради каждой проверки. process.env.NODE_ENV
+      // подставляется бандлером в собранном бинарнике, поэтому в проде
+      // ветка вообще не попадает в бинарник.
+      if (process.env.NODE_ENV !== 'production' && process.env.REDOS_DEMO_UPDATE) {
+        const fake = process.env.REDOS_DEMO_UPDATE === '1' ? '9.9.9' : process.env.REDOS_DEMO_UPDATE;
+        setUpdate({ version: fake, done: false });
+        await new Promise(r => setTimeout(r, 3000));
+        setUpdate({ version: fake, done: true });
+        return;
+      }
+
       const check = await checkLatestVersion();
       if (!check?.hasUpdate) return;
+      setUpdate({ version: check.latest, done: false });
       const result = await selfUpdate();
       if (result.startsWith('Обновлено')) {
-        setUpdatedTo(check.latest);
-        add('system', `✓ Обновлено: v${VERSION} → v${check.latest}. Перезапустите redos.`);
+        setUpdate({ version: check.latest, done: true });
+      } else {
+        setUpdate(null);
       }
     })();
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -187,7 +203,7 @@ function App({ autoCmd, initialError }: AppProps) {
   // ── Основной чат-интерфейс ─────────────────────────────────────────────────
   return (
     <Box flexDirection="column">
-      <Header updatedTo={updatedTo} />
+      <Header update={update} />
       {messages.length === 0 && <WelcomeTips />}
       {messages.map(msg => {
         if (msg.role === 'user')  return <UserMessage  key={msg.id} content={msg.content} />;
