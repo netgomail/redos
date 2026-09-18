@@ -12,14 +12,14 @@ BINARY_NAME="redos-linux"
 CYAN='\033[0;96m'; GREEN='\033[0;92m'; RED='\033[0;91m'
 YELLOW='\033[0;93m'; GRAY='\033[0;90m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
 
-# Маркеры в том же стиле, что использует автообновление внутри redos, —
-# первая установка и последующие обновления должны выглядеть одинаково.
+# Маркеры те же, что у экрана `redos update`, — установка и обновление
+# должны выглядеть одинаково.
 step()    { echo -e "  ${CYAN}\u203a${NC} $*"; }
 ok()      { echo -e "  ${GREEN}${BOLD}\u2713${NC} $*"; }
 warn()    { echo -e "  ${YELLOW}!${NC} ${GRAY}$*${NC}"; }
 fail()    { echo -e "  ${RED}${BOLD}\u2717${NC} $*" >&2; exit 1; }
 
-# ── Прогресс-бар ───────────────────────────────────────────────────────────────
+# ── Прогресс-бар (тот же, что рисует `redos update`) ──────────────────────────
 BAR_W=22
 BAR_DRAWN=0
 mb()      { awk -v b="${1:-0}" 'BEGIN { printf "%.1f", b / 1048576 }'; }
@@ -73,7 +73,7 @@ step "Каталог установки: $INSTALL_DIR"
 DOWNLOAD_URL="https://github.com/${REPO}/releases/download/v${VERSION}/${BINARY_NAME}"
 TMP="$(mktemp)"
 
-# Размер узнаём заранее, чтобы рисовать бар прогресса.
+# Размер узнаём заранее, чтобы рисовать тот же бар, что и `redos update`.
 # -L обязателен: GitHub отдаёт 302 на облако, content-length только в конце цепочки.
 TOTAL=$(curl -fsSLI "$DOWNLOAD_URL" 2>/dev/null \
         | tr -d '\r' | awk 'tolower($1) == "content-length:" { v = $2 } END { print v + 0 }')
