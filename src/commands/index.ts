@@ -19,7 +19,6 @@ export const COMMANDS: CommandDef[] = [
   { name: '/inventory',     description: 'инвентаризация системы', usage: '/inventory [файл.txt]', showInTips: true },
   { name: '/passwd-policy', description: 'парольная политика — сложность и срок смены', showInTips: true },
   { name: '/printer',       description: 'печать и сканирование — лечение очереди, только один МФУ', showInTips: true },
-  { name: '/update',        description: 'проверить и установить обновление redos' },
   { name: '/usb-policy',    description: 'контроль USB-устройств: категории и исключения', showInTips: true },
   { name: '/quit',          description: 'завершить работу' },
 ];
@@ -150,7 +149,6 @@ export function useCommands(
       case '/inventory':     handleInventory(add, arg); break;
       case '/passwd-policy': handlePasswdPolicy(add, openScreen, exit); break;
       case '/printer':       handlePrinter(add, openScreen, exit); break;
-      case '/update':        openScreen('update'); break;
       case '/usb-policy':    handleUsbPolicy(add, openScreen, exit); break;
       default:               add('error', 'Неизвестная команда: ' + cmd + '  (введите /help)');
     }

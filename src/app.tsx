@@ -7,7 +7,6 @@ import { PasswordPolicyScreen } from './components/PasswordPolicyScreen';
 import { USBPolicyScreen } from './components/USBPolicyScreen';
 import { PrinterScreen }   from './components/PrinterScreen';
 import { InstallScreen }   from './components/InstallScreen';
-import { UpdateScreen }    from './components/UpdateScreen';
 import {
   UserMessage,
   SystemMessage, ErrorMessage,
@@ -27,9 +26,6 @@ function App({ autoCmd, initialError }: AppProps) {
   const { exit } = useApp();
   const { messages, add, clear } = useMessages();
   const [screen, setScreen] = useState<Screen>('chat');
-  // Версия, до которой обновились в этом сеансе. Пока не null — держит
-  // напоминание о перезапуске в шапке (см. Header).
-  const [updatedTo, setUpdatedTo] = useState<string | null>(null);
 
   const {
     input, setInput,
@@ -163,24 +159,11 @@ function App({ autoCmd, initialError }: AppProps) {
   if (screen === 'install') {
     return <InstallScreen onExit={() => setScreen('chat')} />;
   }
-  if (screen === 'update') {
-    return (
-      <UpdateScreen
-        onExit={installedVersion => {
-          setScreen('chat');
-          if (installedVersion) {
-            setUpdatedTo(installedVersion);
-            add('system', `✓ Обновлено: v${VERSION} → v${installedVersion}. Перезапустите redos.`);
-          }
-        }}
-      />
-    );
-  }
 
   // ── Основной чат-интерфейс ─────────────────────────────────────────────────
   return (
     <Box flexDirection="column">
-      <Header updatedTo={updatedTo} />
+      <Header />
       {messages.length === 0 && <WelcomeTips />}
       {messages.map(msg => {
         if (msg.role === 'user')  return <UserMessage  key={msg.id} content={msg.content} />;
