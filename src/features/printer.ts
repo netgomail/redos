@@ -1,181 +1,280 @@
 /**
- * Печать и сканирование: лечение «принтер отвалился» и режим «только один МФУ».
+ * Печать и сканирование: перевод сетевых МФУ HP (M426 и подобных) с hplip
+ * на driverless — IPP Everywhere для печати и eSCL (sane-airscan) для
+ * сканирования.
  *
- * Две задачи, обе из практики РедОС 8 с HP LaserJet MFP M426fdn:
+ * Откуда это взялось (РедОС 8, HP LaserJet MFP M426fdn):
  *
- *  1. Очередь CUPS уходит в «отключён» и сама не возвращается. При разовой
- *     ошибке бэкенда CUPS по умолчанию ставит error-policy=stop-printer,
- *     останавливает очередь и больше её не включает. Особенно часто это даёт
- *     бэкенд hplip (hp:/net/...): «open device failed stat=12», когда МФУ спит
- *     или занят. Лечится переводом очереди на драйверless IPP Everywhere
- *     и error-policy=retry-job.
+ *  - Очередь на бэкенде hplip (hp:/net/...) перед каждым заданием читает
+ *    device-id аппарата по SNMP. Если МФУ спит или пакет потерялся —
+ *    «unable to read device-id», «open device failed stat=12», бэкенд
+ *    завершается с ошибкой, и CUPS по error-policy=stop-printer
+ *    останавливает очередь. Обратно её включал только root через HP Device
+ *    Manager — пока у пользователей был sudo, это маскировало проблему.
  *
- *  2. В сети несколько одинаковых аппаратов, и через mDNS они все лезут в
- *     списки печати и сканирования (на каждый — ещё и по два сканера: airscan
- *     и hpaio). Пользователь выбирает не тот и «принтер не печатает».
- *     Лечится жёсткой привязкой: одна очередь на IPP по IP, один бэкенд SANE
- *     (airscan) с устройством по IP, автопоиск выключен, avahi отключён.
+ *  - Драйвер «everywhere» (lpadmin -m everywhere) строит PPD по ответу
+ *    самого аппарата и печатает по IPP на порт 631 — без hplip и SNMP.
+ *    С error-policy=retry-job разовая ошибка больше не останавливает очередь.
  *
- * Перед изменениями системных файлов делается бэкап со скриптом отката.
+ *  - Через mDNS в списки печати и сканирования лезут все одинаковые МФУ сети.
+ *    Поэтому cups-browsed и avahi отключаются, а сканер задаётся по IP.
+ *
+ * Порядок перевода важен: hplip удаляется последним и только после того, как
+ * тестовая страница через новую очередь прошла. Перед изменениями — бэкап
+ * /etc/cups и /etc/sane.d со скриптом отката.
  */
 
+import { readdirSync } from 'fs';
 import { readFile } from '../utils/fs';
-import { sudoRun, writeSudo } from '../utils/sudo';
+import { isRoot } from '../utils/sudo';
 import type { FixResult } from '../utils/sudo';
-import { runPty, runPtyLines } from '../utils/terminal';
+import { runPty, runPtyLines, stripAnsi } from '../utils/terminal';
+import { getPrinterAttributes, summarize, blockingReasons } from './ipp';
+import type { PrinterInfo } from './ipp';
 
-export const SANE_DLL      = '/etc/sane.d/dll.conf';
-export const SANE_AIRSCAN  = '/etc/sane.d/airscan.conf';
-export const SANE_HPAIO    = '/etc/sane.d/dll.d/hpaio';
-export const CUPS_LPOPTS   = '/etc/cups/lpoptions';
+export const SANE_AIRSCAN = '/etc/sane.d/airscan.conf';
+export const CUPS_LPOPTS  = '/etc/cups/lpoptions';
 const HEADER_MARK = '# redos-printer: managed';
+const CUPS_TESTPAGE = '/usr/share/cups/data/testprint';
+
+/** Службы автообнаружения, которые показывают чужие МФУ. */
+export const DISCOVERY_UNITS = [
+  'cups-browsed.service',
+  'avahi-daemon.socket',
+  'avahi-daemon.service',
+] as const;
 
 /** Локаль для разбора вывода: иначе lpstat отвечает по-русски и парсер ломается. */
 const C_LOCALE = { LC_ALL: 'C', LANG: 'C', LANGUAGE: 'C' };
 
-// ─── типы ─────────────────────────────────────────────────────────────────────
+// ─── запуск команд ────────────────────────────────────────────────────────────
 
-export interface PrintQueue {
-  name:        string;
-  uri:         string;   // ipp://10.82.230.22/ipp/print
-  backend:     string;   // ipp | hp | hpfax | usb | socket | dnssd
-  ip:          string;   // вытащен из URI, пусто для usb:/dnssd:
-  enabled:     boolean;  // очередь включена (cupsenable)
-  accepting:   boolean;  // принимает задания (cupsaccept)
-  stateText:   string;   // «idle», «disabled since ...»
-  reason:      string;   // причина остановки, если есть
-  isDefault:   boolean;
-  errorPolicy: string;   // stop-printer | retry-job | ''
-  jobs:        number;   // заданий в очереди
+/**
+ * Асинхронный запуск системной команды: Ink продолжает рисовать лог, пока
+ * идут долгие lpadmin (опрашивает аппарат) и dnf. Команда /printer открывается
+ * только под root, sudo -n — на случай запуска из-под sudo-пользователя.
+ */
+async function sys(argv: string[], timeoutMs = 60_000): Promise<FixResult & { code: number }> {
+  const full = isRoot() ? argv : ['sudo', '-n', ...argv];
+  const r = await runPty(full, { env: C_LOCALE, timeoutMs });
+  const out = stripAnsi(r.output).trim();
+  if (r.code === 0) return { ok: true, msg: out, code: 0 };
+  if (/password is required|a password/.test(out))
+    return { ok: false, msg: 'Требуется sudo. Запустите: sudo redos', code: r.code };
+  const tail = out.split('\n').filter(Boolean).slice(-3).join(' / ');
+  return { ok: false, msg: r.timedOut ? `${argv[0]}: превышено время ожидания` : tail || `exit ${r.code}`, code: r.code };
 }
 
-export interface DiscoveredMfp {
-  ip:    string;
-  name:  string;  // подпись из mDNS или с самого аппарата
-  model: string;  // pwg:MakeAndModel из eSCL, если ответил
-  escl:  boolean; // отвечает по eSCL — значит и сканер тоже он
+async function lines(argv: string[], timeoutMs = 15_000): Promise<string[]> {
+  return runPtyLines(argv, { env: C_LOCALE, timeoutMs });
 }
 
-export interface Diagnosis {
-  queue:      PrintQueue;
-  ping:       boolean | null;   // null — IP неизвестен, проверять нечего
-  port631:    boolean | null;
-  port9100:   boolean | null;
-  escl:       boolean | null;
-  journal:    string[];         // строки из журнала про остановку
-  problems:   string[];         // человекочитаемые выводы
-}
+const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
-// ─── чтение состояния CUPS ────────────────────────────────────────────────────
-
-function backendOf(uri: string): string {
-  return uri.split(':')[0] ?? '';
+export function isIpv4(s: string): boolean {
+  const p = s.split('.');
+  return p.length === 4 && p.every(x => /^\d{1,3}$/.test(x) && Number(x) <= 255);
 }
 
 export function ipFromUri(uri: string): string {
   return uri.match(/\b(\d{1,3}(?:\.\d{1,3}){3})\b/)?.[1] ?? '';
 }
 
-/** Бэкенды, которые в этой связке ненадёжны и подлежат замене на IPP. */
-export function isFragileBackend(backend: string): boolean {
-  return backend === 'hp' || backend === 'hpfax' || backend === 'usb';
+function escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-export async function listQueues(): Promise<PrintQueue[]> {
-  const env = C_LOCALE;
+// ─── очереди CUPS ─────────────────────────────────────────────────────────────
 
-  const [vLines, pLines, dLines, oLines] = await Promise.all([
-    runPtyLines(['lpstat', '-v'], { env, timeoutMs: 15_000 }),
-    runPtyLines(['lpstat', '-p'], { env, timeoutMs: 15_000 }),
-    runPtyLines(['lpstat', '-d'], { env, timeoutMs: 15_000 }),
-    runPtyLines(['lpstat', '-o'], { env, timeoutMs: 15_000 }),
-  ]);
+export interface PrintQueue {
+  name:        string;
+  uri:         string;   // ipp://10.82.230.207/ipp/print
+  backend:     string;   // ipp | hp | hpfax | usb | socket | dnssd
+  ip:          string;   // из URI, пусто для usb:/dnssd:
+  enabled:     boolean;
+  accepting:   boolean;
+  stateText:   string;
+  reason:      string;   // причина остановки
+  isDefault:   boolean;
+  errorPolicy: string;   // stop-printer | retry-job | ''
+  jobs:        number;   // незавершённых заданий
+}
 
-  // device for HP_M426fdn: ipp://10.82.230.22/ipp/print
+/** Бэкенды hplip: без hplip не работают, при переводе удаляются. */
+export function isHplipBackend(backend: string): boolean {
+  return backend === 'hp' || backend === 'hpfax';
+}
+
+/** Очередь уже переведена: IPP по IP и retry-job. */
+export function isDriverless(q: PrintQueue): boolean {
+  return (q.backend === 'ipp' || q.backend === 'ipps') && q.ip !== '';
+}
+
+/** Разбор lpstat -v/-p/-d/-o (под LC_ALL=C). Без побочных эффектов — для тестов. */
+export function parseQueues(v: string[], p: string[], d: string[], o: string[]): PrintQueue[] {
   const queues = new Map<string, PrintQueue>();
-  for (const l of vLines) {
+  for (const l of v) {
     const m = l.match(/^device for ([^:]+):\s*(.+)$/);
     if (!m) continue;
     const uri = m[2].trim();
     queues.set(m[1], {
       name: m[1], uri,
-      backend: backendOf(uri),
+      backend: uri.split(':')[0] ?? '',
       ip: ipFromUri(uri),
       enabled: true, accepting: true,
       stateText: '', reason: '', isDefault: false,
       errorPolicy: '', jobs: 0,
     });
   }
-  if (queues.size === 0) return [];
 
-  // printer HP_M426fdn is idle.  enabled since ...
-  // printer HP_M426fdn disabled since ...  -
+  // printer HP is idle.  enabled since ...
+  // printer HP disabled since ...  -
   //         Printer stopped due to backend errors
-  let current: PrintQueue | undefined;
-  for (const l of pLines) {
-    const m = l.match(/^printer (\S+) (is |now )?(\S+)/);
+  let cur: PrintQueue | undefined;
+  for (const l of p) {
+    const m = l.match(/^printer (\S+) /);
     if (m) {
-      current = queues.get(m[1]);
-      if (current) {
-        current.stateText = l.replace(/^printer \S+\s*/, '').trim();
-        current.enabled   = !/disabled|stopped/i.test(l);
+      cur = queues.get(m[1]);
+      if (cur) {
+        cur.stateText = l.replace(/^printer \S+\s*/, '').trim();
+        cur.enabled   = !/disabled|stopped/i.test(l);
       }
       continue;
     }
-    // продолжение — причина остановки с отступом
-    if (current && /^\s+\S/.test(l) && !current.reason) {
+    if (cur && /^\s+\S/.test(l) && !cur.reason) {
       const reason = l.trim();
-      if (reason && reason !== '-') current.reason = reason;
+      if (reason !== '-') cur.reason = reason;
     }
   }
 
-  const def = dLines.find(l => l.includes('default destination'))?.match(/:\s*(\S+)/)?.[1];
+  const def = d.find(l => l.includes('default destination'))?.match(/:\s*(\S+)/)?.[1];
   if (def && queues.has(def)) queues.get(def)!.isDefault = true;
 
-  // задания: строки вида "HP_M426fdn-12  user  1024  дата"
-  for (const l of oLines) {
-    const q = l.match(/^(\S+?)-\d+\s/)?.[1];
+  for (const l of o) {
+    const q = l.match(/^(\S+)-\d+\s/)?.[1];
     if (q && queues.has(q)) queues.get(q)!.jobs++;
   }
-
-  // accepting и error-policy — по каждой очереди отдельно
-  await Promise.all([...queues.values()].map(async q => {
-    const [acc, policy] = await Promise.all([
-      runPtyLines(['lpstat', '-a', q.name], { env, timeoutMs: 10_000 }),
-      readErrorPolicy(q.name),
-    ]);
-    q.accepting   = !acc.some(l => /not accepting/i.test(l));
-    q.errorPolicy = policy;
-  }));
-
   return [...queues.values()];
 }
 
-/**
- * printer-error-policy не показывает ни lpstat, ни всегда lpoptions,
- * поэтому пробуем оба источника: lpoptions, затем printers.conf (нужен root).
- */
-async function readErrorPolicy(queue: string): Promise<string> {
-  const out = await runPtyLines(['lpoptions', '-p', queue], { env: C_LOCALE, timeoutMs: 10_000 });
-  const fromOpts = out.join(' ').match(/printer-error-policy=(\S+)/)?.[1];
-  if (fromOpts) return fromOpts.replace(/['"]/g, '');
+export async function listQueues(): Promise<PrintQueue[]> {
+  const [v, p, d, o] = await Promise.all([
+    lines(['lpstat', '-v']), lines(['lpstat', '-p']),
+    lines(['lpstat', '-d']), lines(['lpstat', '-o']),
+  ]);
+  const queues = parseQueues(v, p, d, o);
+  const conf = readFile('/etc/cups/printers.conf') ?? '';
+  await Promise.all(queues.map(async q => {
+    const acc = await lines(['lpstat', '-a', q.name], 10_000);
+    q.accepting   = !acc.some(l => /not accepting/i.test(l));
+    q.errorPolicy = errorPolicyFrom(conf, q.name);
+  }));
+  return queues;
+}
 
-  const conf = readFile('/etc/cups/printers.conf');
-  if (!conf) return '';
-  // <Printer HP_M426fdn> ... ErrorPolicy retry-job ... </Printer>
-  const block = conf.match(
+/** ErrorPolicy очереди из printers.conf (читается под root). */
+export function errorPolicyFrom(printersConf: string, queue: string): string {
+  const block = printersConf.match(
     new RegExp(`<(?:Default)?Printer ${escapeRe(queue)}>([\\s\\S]*?)</(?:Default)?Printer>`),
   )?.[1];
   return block?.match(/^\s*ErrorPolicy\s+(\S+)/m)?.[1] ?? '';
 }
 
-function escapeRe(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+// ─── состояние системы ────────────────────────────────────────────────────────
+
+export interface AirscanConf {
+  ip:                string;   // IP устройства eSCL
+  discoveryDisabled: boolean;
+  managed:           boolean;  // записан этой утилитой
 }
 
-// ─── диагностика ──────────────────────────────────────────────────────────────
+export interface SystemState {
+  queues:      PrintQueue[];
+  hplip:       string[];                          // установленные пакеты hplip
+  hpSystray:   boolean;
+  units:       { unit: string; enabled: string; active: boolean }[];
+  sharing:     'off' | 'on' | 'unknown';          // общий доступ CUPS
+  saneAirscan: boolean;
+  airscan:     AirscanConf;
+}
 
-/** TCP-проверка порта без внешних утилит. */
+/** Автообнаружение выключено: все службы замаскированы/отсутствуют и не работают. */
+export function discoveryHidden(s: SystemState): boolean {
+  return s.units.every(u => (u.enabled === 'masked' || u.enabled === 'not-found' || u.enabled === '') && !u.active);
+}
+
+export function parseAirscanConf(text: string): AirscanConf {
+  let section = '';
+  let ip = '';
+  let discoveryDisabled = false;
+  for (const raw of text.split('\n')) {
+    const l = raw.replace(/[;#].*$/, '').trim();
+    if (!l) continue;
+    const sec = l.match(/^\[(\w+)\]$/);
+    if (sec) { section = sec[1].toLowerCase(); continue; }
+    if (section === 'options' && /^discovery\s*=\s*disable$/i.test(l)) discoveryDisabled = true;
+    if (section === 'devices' && !ip && /eSCL/i.test(l)) ip = ipFromUri(l);
+  }
+  return { ip, discoveryDisabled, managed: text.includes(HEADER_MARK) };
+}
+
+export function airscanConf(scannerName: string, ip: string): string {
+  return [
+    HEADER_MARK,
+    '# Сканер задан по IP, автопоиск выключен: в сети несколько одинаковых МФУ.',
+    '',
+    '[devices]',
+    `"${scannerName.replace(/"/g, "'")}" = http://${ip}/eSCL/, eSCL`,
+    '',
+    '[options]',
+    'discovery = disable',
+    '',
+  ].join('\n');
+}
+
+export async function readSystemState(): Promise<SystemState> {
+  const [queues, rpm, systray, cupsctl, airscanPkg, ...unitInfo] = await Promise.all([
+    listQueues(),
+    lines(['rpm', '-qa', '--qf', '%{NAME}\\n', 'hplip*', 'libsane-hpaio*']),
+    runPty(['pgrep', '-f', 'hp-systray'], { timeoutMs: 5000 }),
+    lines(['cupsctl'], 10_000),
+    runPty(['rpm', '-q', 'sane-airscan'], { timeoutMs: 10_000 }),
+    ...DISCOVERY_UNITS.map(async unit => {
+      const [en, act] = await Promise.all([
+        lines(['systemctl', 'is-enabled', unit], 8000),
+        runPty(['systemctl', 'is-active', '-q', unit], { timeoutMs: 8000 }),
+      ]);
+      const enabled = en.map(s => s.trim()).find(Boolean) ?? '';
+      return { unit, enabled: /No such file|not-found/i.test(enabled) ? 'not-found' : enabled, active: act.code === 0 };
+    }),
+  ]);
+
+  const opts = Object.fromEntries(cupsctl.map(l => l.trim().split('=')).filter(kv => kv.length === 2));
+  const sharing = opts._share_printers === undefined ? 'unknown'
+    : opts._share_printers === '0' && opts._remote_any !== '1' ? 'off' : 'on';
+
+  return {
+    queues,
+    hplip:       rpm.map(s => s.trim()).filter(s => /^(hplip[\w-]*|libsane-hpaio)$/.test(s)),
+    hpSystray:   systray.code === 0,
+    units:       unitInfo,
+    sharing,
+    saneAirscan: airscanPkg.code === 0,
+    airscan:     parseAirscanConf(readFile(SANE_AIRSCAN) ?? ''),
+  };
+}
+
+// ─── проверка аппарата ────────────────────────────────────────────────────────
+
+export interface PrinterProbe {
+  ip:      string;
+  ping:    boolean;
+  port631: boolean;
+  escl:    boolean;
+  ipp:     PrinterInfo | null;
+  ippError: string;
+}
+
 export async function checkPort(ip: string, port: number, timeoutMs = 2000): Promise<boolean> {
   const { createConnection } = await import('net');
   return new Promise(resolve => {
@@ -194,7 +293,7 @@ export async function pingHost(ip: string): Promise<boolean> {
   return r.code === 0;
 }
 
-/** Спрашивает у аппарата его модель по eSCL. Заодно проверяет, что это МФУ. */
+/** eSCL по http: https к МФУ перехватывает антивирус. */
 export async function probeEscl(ip: string, timeoutMs = 6000): Promise<{ ok: boolean; model: string }> {
   try {
     const ctrl = new AbortController();
@@ -203,366 +302,477 @@ export async function probeEscl(ip: string, timeoutMs = 6000): Promise<{ ok: boo
     clearTimeout(t);
     if (!resp.ok) return { ok: false, model: '' };
     const xml = await resp.text();
-    const model = xml.match(/<pwg:MakeAndModel>([^<]*)</)?.[1]?.trim() ?? '';
-    return { ok: true, model };
+    return { ok: true, model: xml.match(/<pwg:MakeAndModel>([^<]*)</)?.[1]?.trim() ?? '' };
   } catch {
     return { ok: false, model: '' };
   }
 }
 
-/** Почему очередь встала: сеть, порты, записи в журнале cups. */
-export async function diagnose(queue: PrintQueue): Promise<Diagnosis> {
-  const ip = queue.ip;
-  const [ping, journal] = await Promise.all([
-    ip ? pingHost(ip) : Promise.resolve(null),
-    readCupsJournal(),
-  ]);
+export async function probePrinter(ip: string): Promise<PrinterProbe> {
+  const res: PrinterProbe = { ip, ping: false, port631: false, escl: false, ipp: null, ippError: '' };
+  res.ping = await pingHost(ip);
+  if (!res.ping) return res;
+  const [p631, escl] = await Promise.all([checkPort(ip, 631), probeEscl(ip)]);
+  res.port631 = p631;
+  res.escl = escl.ok;
+  if (p631) {
+    try {
+      const r = await getPrinterAttributes(ip);
+      if (r.status >= 0x0100) res.ippError = `IPP status 0x${r.status.toString(16).padStart(4, '0')}`;
+      else res.ipp = summarize(r.attrs);
+    } catch (e) {
+      res.ippError = (e as Error).message;
+    }
+  }
+  return res;
+}
 
-  let port631: boolean | null = null;
-  let port9100: boolean | null = null;
-  let escl: boolean | null = null;
-  if (ip && ping) {
-    [port631, port9100, { ok: escl }] = await Promise.all([
-      checkPort(ip, 631),
-      checkPort(ip, 9100),
-      probeEscl(ip),
-    ]);
+/** Почему перевод на этот IP невозможен; пустая строка — можно. */
+export function migrationBlocker(p: PrinterProbe): string {
+  if (!p.ping)    return `${p.ip} не отвечает на ping — МФУ выключен или недоступен по сети`;
+  if (!p.port631) return `порт 631 (IPP) на ${p.ip} закрыт — включите IPP в веб-интерфейсе МФУ`;
+  if (!p.ipp)     return `МФУ не ответил по IPP${p.ippError ? ': ' + p.ippError : ''}`;
+  if (!p.ipp.everywhere)
+    return 'МФУ не сообщает поддержку PWG-raster/URF — IPP Everywhere невозможен';
+  return '';
+}
+
+// ─── диагностика ──────────────────────────────────────────────────────────────
+
+export interface Diagnosis {
+  queue:    PrintQueue;
+  probe:    PrinterProbe | null;  // null — в URI нет IP
+  journal:  string[];
+  problems: string[];
+  /** Рекомендуемое действие. */
+  advice:   'migrate' | 'restore' | 'printer' | 'none';
+}
+
+/** Строки журнала cups, которые объясняют остановку очереди. */
+export function filterCupsJournal(journal: string[]): string[] {
+  return journal
+    .filter(l => /stopped due to|open device failed|unable to read device-id|returned status [1-9]|Unable to (open|connect)|Backend \S+ returned/i.test(l))
+    .slice(-6);
+}
+
+export function analyze(queue: PrintQueue, probe: PrinterProbe | null, journal: string[]): Diagnosis {
+  const problems: string[] = [];
+  const hplipFail = journal.some(l => /open device failed|unable to read device-id/i.test(l));
+
+  if (!queue.enabled)   problems.push(`очередь остановлена${queue.reason ? ': ' + queue.reason : ''}`);
+  if (!queue.accepting) problems.push('очередь не принимает задания');
+  if (isHplipBackend(queue.backend))
+    problems.push(`бэкенд ${queue.backend} (hplip): перед каждым заданием читает device-id по SNMP, ` +
+                  'спящий МФУ даёт «open device failed» и остановку очереди');
+  if (hplipFail)
+    problems.push('в журнале cups есть сбои hplip (open device failed / unable to read device-id)');
+  if (queue.errorPolicy && queue.errorPolicy !== 'retry-job')
+    problems.push(`error-policy=${queue.errorPolicy} — первая же ошибка снова остановит очередь`);
+  if (queue.jobs > 0) problems.push(`в очереди заданий: ${queue.jobs}`);
+  if (!queue.ip && queue.backend !== 'usb') problems.push('в URI очереди нет IP — адрес МФУ неизвестен');
+
+  let printerBad = false;
+  if (probe) {
+    const block = migrationBlocker(probe);
+    if (block) { problems.push(block); printerBad = !probe.ping || !probe.port631; }
+    const reasons = probe.ipp ? blockingReasons(probe.ipp.reasons) : [];
+    if (reasons.length) { problems.push(`МФУ сообщает: ${reasons.join(', ')}`); printerBad = true; }
+    if (probe.ipp?.state === 'stopped') { problems.push('МФУ в состоянии stopped'); printerBad = true; }
   }
 
-  const problems: string[] = [];
-  if (!queue.enabled)
-    problems.push(`очередь отключена${queue.reason ? ': ' + queue.reason : ''}`);
-  if (!queue.accepting)
-    problems.push('очередь не принимает задания');
-  if (queue.errorPolicy && queue.errorPolicy !== 'retry-job')
-    problems.push(`error-policy=${queue.errorPolicy} — при первой же ошибке CUPS снова остановит очередь`);
-  if (isFragileBackend(queue.backend))
-    problems.push(`бэкенд ${queue.backend}: ненадёжен, аппарат «засыпает» и очередь встаёт`);
-  if (!ip && queue.backend !== 'usb')
-    problems.push('в URI очереди нет IP — адрес аппарата неизвестен');
-  if (ping === false)
-    problems.push(`${ip} не отвечает на ping — аппарат выключен или проблема в сети`);
-  if (ping && port631 === false)
-    problems.push('порт 631 (IPP) закрыт — печать по IPP работать не будет');
-  if (queue.jobs > 0)
-    problems.push(`в очереди застряло заданий: ${queue.jobs}`);
+  const advice: Diagnosis['advice'] =
+      printerBad ? 'printer'
+    : !isDriverless(queue) || (queue.errorPolicy && queue.errorPolicy !== 'retry-job') ? 'migrate'
+    : !queue.enabled || !queue.accepting || queue.jobs > 0 ? 'restore'
+    : 'none';
 
-  return { queue, ping, port631, port9100, escl, journal, problems };
+  return { queue, probe, journal, problems, advice };
 }
 
-async function readCupsJournal(): Promise<string[]> {
-  const lines = await runPtyLines(
-    ['journalctl', '-u', 'cups', '--since', '-30 days', '--no-pager'],
-    { env: C_LOCALE, timeoutMs: 20_000 },
-  );
-  return lines
-    .filter(l => /stopped due to|open device failed|returned status 1|Unable to (open|connect)/i.test(l))
-    .slice(-5);
+export async function diagnose(queue: PrintQueue): Promise<Diagnosis> {
+  const [probe, journal] = await Promise.all([
+    queue.ip ? probePrinter(queue.ip) : Promise.resolve(null),
+    lines(['journalctl', '-u', 'cups', '--since', '-30 days', '--no-pager'], 20_000),
+  ]);
+  return analyze(queue, probe, filterCupsJournal(journal));
 }
 
-// ─── лечение очереди ──────────────────────────────────────────────────────────
-
-export interface FixOptions {
-  /** Переключить очередь на ipp://IP/ipp/print. Пусто — оставить URI как есть. */
-  ip?:       string;
-  testPage?: boolean;
-  onStep?:   (msg: string) => void;
-}
+// ─── восстановление остановленной очереди ────────────────────────────────────
 
 /**
- * Приводит очередь в рабочее состояние: сетевой IPP вместо hplip/usb,
- * error-policy=retry-job, включение, приём заданий, снятие застрявших.
- * Повторяет логику fix-printer.sh.
+ * Быстрое действие для очереди, которая уже на IPP: включить, принять,
+ * поставить retry-job, снять застрявшие задания. Бэкенд не трогает.
  */
-export async function fixQueue(queue: PrintQueue, opts: FixOptions = {}): Promise<FixResult> {
-  const step = opts.onStep ?? (() => {});
-  const ip   = opts.ip?.trim() || queue.ip;
+export async function restoreQueue(queue: PrintQueue, onStep: (m: string) => void = () => {}): Promise<FixResult> {
   const done: string[] = [];
-
-  if (isFragileBackend(queue.backend)) {
-    if (!ip) {
-      return {
-        ok: false,
-        msg: `Очередь на бэкенде ${queue.backend}, но IP аппарата неизвестен — укажите его вручную.`,
-      };
-    }
-    step(`Перевожу очередь с ${queue.backend} на ipp://${ip}/ipp/print`);
-    const r = sudoRun(['lpadmin', '-p', queue.name, '-E',
-                       '-v', `ipp://${ip}/ipp/print`, '-m', 'everywhere', '-L', ip]);
-    if (!r.ok) return { ok: false, msg: `lpadmin: ${r.msg}` };
-    done.push('бэкенд переведён на IPP Everywhere');
-  } else {
-    step('Бэкенд уже сетевой — менять не нужно');
-  }
-
-  // Ключевое: не выключать очередь из-за разовой ошибки
-  step('Ставлю error-policy=retry-job');
-  const rp = sudoRun(['lpadmin', '-p', queue.name, '-o', 'printer-error-policy=retry-job']);
-  if (!rp.ok) return { ok: false, msg: `lpadmin -o error-policy: ${rp.msg}` };
+  onStep('error-policy=retry-job');
+  const rp = await sys(['lpadmin', '-p', queue.name, '-o', 'printer-error-policy=retry-job']);
+  if (!rp.ok) return { ok: false, msg: `lpadmin: ${rp.msg}` };
   done.push('error-policy=retry-job');
-
-  step('Включаю очередь и приём заданий');
-  if (sudoRun(['cupsenable', queue.name]).ok) done.push('очередь включена');
-  if (sudoRun(['cupsaccept', queue.name]).ok) done.push('приём заданий разрешён');
-
+  onStep('Включаю очередь и приём заданий');
+  if ((await sys(['cupsenable', queue.name])).ok) done.push('очередь включена');
+  if ((await sys(['cupsaccept', queue.name])).ok) done.push('приём заданий разрешён');
   if (queue.jobs > 0) {
-    step(`Снимаю застрявшие задания (${queue.jobs})`);
-    sudoRun(['cancel', '-a', queue.name]);
-    done.push(`снято заданий: ${queue.jobs}`);
+    onStep(`Снимаю застрявшие задания (${queue.jobs})`);
+    if ((await sys(['cancel', '-a', queue.name])).ok) done.push(`снято заданий: ${queue.jobs}`);
   }
-
-  if (opts.testPage) {
-    step('Отправляю тестовую страницу');
-    const text = `Тест печати redos — ${new Date().toLocaleString('ru-RU')}\n`;
-    const r = await runPty(['lp', '-d', queue.name], { input: text, timeoutMs: 20_000, env: C_LOCALE });
-    done.push(r.code === 0 ? 'тестовая страница отправлена' : 'тестовую страницу отправить не удалось');
-  }
-
   return { ok: true, msg: done.join('; ') };
 }
 
-// ─── обнаружение МФУ в сети ───────────────────────────────────────────────────
+// ─── перевод на driverless: план ─────────────────────────────────────────────
 
-/**
- * Ищет сетевые МФУ: сначала mDNS (avahi-browse), затем то, что уже знает CUPS
- * (lpinfo -v). Найденные адреса опрашиваются по eSCL, чтобы получить модель
- * и понять, что это МФУ со сканером.
- */
-export async function discoverMfp(onStep?: (m: string) => void): Promise<DiscoveredMfp[]> {
-  const step = onStep ?? (() => {});
-  const byIp = new Map<string, { name: string }>();
-
-  step('Опрашиваю mDNS (avahi-browse)...');
-  // =;wlan0;IPv4;HP%20LaserJet;_ipp._tcp;local;printer.local;10.82.230.22;631;"txt"
-  for (const svc of ['_ipp._tcp', '_uscan._tcp']) {
-    const lines = await runPtyLines(['avahi-browse', '-rtp', svc], { timeoutMs: 15_000, env: C_LOCALE });
-    for (const l of lines) {
-      if (!l.startsWith('=')) continue;
-      const f = l.split(';');
-      const ip = f[7]?.trim();
-      if (!ip || !/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) continue;
-      const name = decodeURIComponent((f[3] ?? '').replace(/\\(\d{3})/g, (_, d) =>
-        String.fromCharCode(parseInt(d, 10))));
-      if (!byIp.has(ip)) byIp.set(ip, { name: name || ip });
-    }
-  }
-
-  step('Смотрю, что видит CUPS (lpinfo -v)...');
-  const lp = await runPtyLines(['lpinfo', '-v'], { timeoutMs: 25_000, env: C_LOCALE });
-  for (const l of lp) {
-    const ip = ipFromUri(l);
-    if (ip && !byIp.has(ip)) byIp.set(ip, { name: ip });
-  }
-
-  const ips = [...byIp.keys()];
-  if (ips.length === 0) return [];
-
-  step(`Опрашиваю найденные аппараты по eSCL (${ips.length})...`);
-  const result = await Promise.all(ips.map(async ip => {
-    const { ok, model } = await probeEscl(ip, 5000);
-    const base = byIp.get(ip)!;
-    return { ip, name: model || base.name, model, escl: ok };
-  }));
-
-  // Сначала те, что ответили по eSCL, — это настоящие МФУ.
-  return result.sort((a, b) => Number(b.escl) - Number(a.escl) || a.ip.localeCompare(b.ip));
+export interface MigrateOptions {
+  ip:           string;
+  queueName:    string;
+  testPage:     boolean;   // тестовая страница перед удалением hplip
+  removeHplip:  boolean;
+  hideDiscovery: boolean;  // cups-browsed, avahi, общий доступ CUPS
+  scanner:      boolean;   // sane-airscan по IP
+  /** Удалить и прочие очереди (не hplip и не на этот IP). */
+  removeOthers: boolean;
 }
 
-// ─── режим «только один МФУ» ──────────────────────────────────────────────────
+export type StepId =
+  | 'backup' | 'queue' | 'remove-queues' | 'discovery'
+  | 'airscan-install' | 'airscan' | 'test-page' | 'hplip';
 
-export interface SetupOptions {
-  ip:          string;
-  /** Имя очереди CUPS. Пусто — берётся существующая с этим IP, иначе HP_MFP. */
-  queueName?:  string;
-  /** Подпись сканера. Пусто — спрашивается у аппарата по eSCL. */
-  scannerName?: string;
-  /** Не отключать avahi. Тогда чужие аппараты останутся видны в mDNS. */
-  keepAvahi?:  boolean;
-  onStep?:     (msg: string) => void;
+export interface PlanStep {
+  id:     StepId;
+  title:  string;
+  detail: string[];
+  danger: boolean;   // необратимо без отката
 }
 
-export interface SetupResult extends FixResult {
-  backupDir?: string;
-  /** Что осталось в системе после настройки — для показа пользователю. */
-  queues?:    string[];
-  scanners?:  string[];
+/** Имя очереди по умолчанию: сохраняем то, к которому привыкли пользователи. */
+export function defaultQueueName(queues: PrintQueue[], ip: string): string {
+  const onIp = queues.filter(q => q.ip === ip);
+  const pick = onIp.find(q => q.isDefault && isDriverless(q))
+    ?? onIp.find(q => isDriverless(q))
+    ?? onIp.find(q => q.isDefault)
+    ?? onIp[0];
+  return pick?.name ?? `HP_MFP_${ip.split('.').pop()}`;
 }
 
-/**
- * Оставляет в системе ровно один принтер и один сканер — указанный МФУ.
- * Печать по IPP Everywhere, сканирование по eSCL/AirScan, автопоиск выключен.
- * Повторяет setup-mfp-only.sh, но с бэкапом через утилиту и понятными шагами.
- */
-export async function setupSingleMfp(opts: SetupOptions): Promise<SetupResult> {
-  const step = opts.onStep ?? (() => {});
-  const ip   = opts.ip.trim();
-  if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) {
-    return { ok: false, msg: `«${ip}» не похож на IP-адрес` };
-  }
-
-  // 1. Проверка доступности — дальше идти бессмысленно
-  step(`Проверяю доступность ${ip}...`);
-  if (!await pingHost(ip)) {
-    return { ok: false, msg: `${ip} не отвечает на ping. Включите МФУ и повторите.` };
-  }
-  const escl = await probeEscl(ip);
-  step(escl.ok
-    ? `eSCL отвечает${escl.model ? ': ' + escl.model : ''}`
-    : 'eSCL не отвечает — сканирование по AirScan может не заработать');
-
-  const existing = await listQueues();
-  const queueName = opts.queueName?.trim()
-    || existing.find(q => q.ip === ip)?.name
-    || 'HP_MFP';
-  const scannerName = opts.scannerName?.trim()
-    || `${escl.model || 'Сетевой МФУ'} (${ip})`;
-
-  // 2. Бэкап
-  const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15);
-  const backupDir = `/root/redos-mfp-backup-${stamp}`;
-  step(`Бэкап в ${backupDir}`);
-  const mk = sudoRun(['mkdir', '-p', backupDir]);
-  if (!mk.ok) return { ok: false, msg: `не удалось создать ${backupDir}: ${mk.msg}` };
-  for (const f of [SANE_DLL, SANE_AIRSCAN, CUPS_LPOPTS, SANE_HPAIO]) {
-    sudoRun(['cp', '-a', f, backupDir + '/']); // отсутствие файла — не ошибка
-  }
-  sudoRun(['cp', '-a', '/etc/sane.d/dll.d', backupDir + '/dll.d']);
-
-  // 3. Очередь печати на IPP Everywhere
-  step(`Очередь ${queueName} → ipp://${ip}/ipp/print`);
-  const la = sudoRun(['lpadmin', '-p', queueName, '-E',
-                      '-v', `ipp://${ip}/ipp/print`, '-m', 'everywhere',
-                      '-L', ip, '-o', 'printer-error-policy=retry-job']);
-  if (!la.ok) return { ok: false, msg: `lpadmin: ${la.msg}`, backupDir };
-  sudoRun(['cupsenable', queueName]);
-  sudoRun(['cupsaccept', queueName]);
-
-  // очередь по умолчанию
-  const lpopts = readFile(CUPS_LPOPTS) ?? '';
-  if (!new RegExp(`^Default ${escapeRe(queueName)}\\b`, 'm').test(lpopts)) {
-    const next = lpopts.replace(/^Default .*$/gm, '').trimEnd();
-    writeSudo(CUPS_LPOPTS, (next ? next + '\n' : '') + `Default ${queueName}\n`);
-  }
-
-  // 4. Лишние очереди — под нож, иначе в списках снова пять одинаковых аппаратов
-  const removed: string[] = [];
-  for (const q of existing) {
-    if (q.name === queueName) continue;
-    step(`Удаляю лишнюю очередь ${q.name}`);
-    if (sudoRun(['lpadmin', '-x', q.name]).ok) removed.push(q.name);
-  }
-
-  // 5. SANE: единственный бэкенд airscan
-  step('SANE: оставляю только бэкенд airscan');
-  const dll = writeSudo(SANE_DLL, [
-    HEADER_MARK,
-    '# Используется единственный сетевой сканер по eSCL (sane-airscan).',
-    '# Остальные бэкенды отключены намеренно, чтобы в списке не появлялись',
-    `# посторонние аппараты. Оригинал — в ${backupDir}.`,
-    'airscan',
-    '',
-  ].join('\n'));
-  if (!dll.ok) return { ok: false, msg: `${SANE_DLL}: ${dll.msg}`, backupDir };
-
-  // hpaio дублирует тот же МФУ и подтягивает чужие
-  if (readFile(SANE_HPAIO) !== null) {
-    step('Отключаю бэкенд hpaio (дублирует тот же аппарат)');
-    sudoRun(['mv', '-f', SANE_HPAIO, SANE_HPAIO + '.disabled']);
-  }
-
-  // 6. airscan: автопоиск выключен, устройство задано по IP
-  step('sane-airscan: автопоиск выключен, устройство задано по IP');
-  const air = writeSudo(SANE_AIRSCAN, [
-    HEADER_MARK,
-    '# Автопоиск отключён: в сети несколько одинаковых МФУ, они путали список.',
-    '',
-    '[options]',
-    'discovery = disable',
-    '',
-    '[devices]',
-    `"${scannerName}" = http://${ip}/eSCL/, eSCL`,
-    '',
-  ].join('\n'));
-  if (!air.ok) return { ok: false, msg: `${SANE_AIRSCAN}: ${air.msg}`, backupDir };
-
-  // 7. mDNS
-  if (opts.keepAvahi) {
-    step('avahi оставлен включённым — чужие аппараты будут видны');
-  } else {
-    step('Отключаю mDNS-обнаружение (avahi)');
-    sudoRun(['systemctl', 'disable', '--now', 'avahi-daemon.socket', 'avahi-daemon.service']);
-    sudoRun(['systemctl', 'mask',    'avahi-daemon.socket', 'avahi-daemon.service']);
-  }
-
-  // 8. Скрипт отката рядом с бэкапом
-  writeSudo(`${backupDir}/rollback.sh`, rollbackScript(backupDir, opts.keepAvahi ?? false));
-  sudoRun(['chmod', '+x', `${backupDir}/rollback.sh`]);
-
-  step('Перезапускаю cups');
-  sudoRun(['systemctl', 'restart', 'cups']);
-
-  // 9. Проверка результата
-  step('Проверяю, что осталось в системе...');
-  const queuesAfter = (await runPtyLines(['lpstat', '-e'], { env: C_LOCALE, timeoutMs: 15_000 }))
-    .filter(l => l.trim());
-  const scannersAfter = (await runPtyLines(
-    ['scanimage', '-L'],
-    { timeoutMs: 70_000, env: { ...C_LOCALE, SANE_CONFIG_DIR: '' } },
-  )).filter(l => l.trim());
-
-  const tail = removed.length ? `, удалено лишних очередей: ${removed.length}` : '';
-  return {
-    ok: true,
-    msg: `Оставлен один МФУ ${ip} (очередь ${queueName})${tail}. Откат: ${backupDir}/rollback.sh`,
-    backupDir,
-    queues:   queuesAfter,
-    scanners: scannersAfter,
-  };
+/** Очереди, которые будут удалены: hplip, прочие на этот IP и (по выбору) все остальные. */
+export function queuesToRemove(queues: PrintQueue[], opts: Pick<MigrateOptions, 'ip' | 'queueName' | 'removeOthers'>): PrintQueue[] {
+  return queues.filter(q => q.name !== opts.queueName
+    && (isHplipBackend(q.backend) || q.ip === opts.ip || opts.removeOthers));
 }
 
-function rollbackScript(backupDir: string, keptAvahi: boolean): string {
+export function planMigration(s: SystemState, o: MigrateOptions): PlanStep[] {
+  const uri = `ipp://${o.ip}/ipp/print`;
+  const steps: PlanStep[] = [];
+
+  steps.push({ id: 'backup', danger: false, title: 'Бэкап /etc/cups, /etc/sane.d и lpoptions пользователей',
+    detail: ['/root/redos-printer-backup-<дата>/ с rollback.sh'] });
+
+  const existing = s.queues.find(q => q.name === o.queueName);
+  steps.push({ id: 'queue', danger: false,
+    title: existing ? `Очередь ${o.queueName} → ${uri} (IPP Everywhere)` : `Новая очередь ${o.queueName} → ${uri}`,
+    detail: [
+      'lpadmin -m everywhere, error-policy=retry-job, односторонняя печать по умолчанию',
+      'включить, принимать задания, сделать очередью по умолчанию',
+      ...(existing && existing.uri !== uri ? [`было: ${existing.uri}`] : []),
+    ] });
+
+  const remove = queuesToRemove(s.queues, o);
+  if (remove.length) steps.push({ id: 'remove-queues', danger: true,
+    title: `Удалить очереди: ${remove.length}`,
+    detail: [...remove.map(q => `${q.name} — ${q.uri}`), 'и убрать их из lpoptions пользователей'] });
+
+  if (o.hideDiscovery) {
+    const units = s.units.filter(u => u.enabled !== 'not-found' && u.enabled !== ''
+      && (u.enabled !== 'masked' || u.active)).map(u => u.unit);
+    const detail = [
+      ...(units.length ? [`остановить и замаскировать: ${units.join(', ')}`] : []),
+      ...(s.sharing !== 'off' ? ['cupsctl --no-share-printers --no-remote-any'] : []),
+    ];
+    if (detail.length) steps.push({ id: 'discovery', danger: false,
+      title: 'Отключить автообнаружение принтеров', detail });
+  }
+
+  if (o.scanner) {
+    if (!s.saneAirscan) steps.push({ id: 'airscan-install', danger: false,
+      title: 'Установить sane-airscan', detail: ['dnf install -y sane-airscan'] });
+    if (s.airscan.ip !== o.ip || !s.airscan.discoveryDisabled) steps.push({ id: 'airscan', danger: false,
+      title: `Сканер: ${SANE_AIRSCAN}`, detail: [`http://${o.ip}/eSCL/, автопоиск выключен`] });
+  }
+
+  if (o.testPage) steps.push({ id: 'test-page', danger: false,
+    title: 'Тестовая страница через новую очередь',
+    detail: ['ждать завершения до 2 минут; при неудаче hplip не удаляется'] });
+
+  if (o.removeHplip && s.hplip.length) steps.push({ id: 'hplip', danger: true,
+    title: 'Удалить hplip',
+    detail: [`dnf remove ${s.hplip.join(' ')}`, 'остановить hp-systray, убрать его автозапуск'] });
+
+  return steps;
+}
+
+// ─── перевод на driverless: выполнение ───────────────────────────────────────
+
+export interface MigrateResult {
+  ok:        boolean;
+  lines:     string[];     // что сделано / что пошло не так
+  backupDir: string;
+  testJob:   string;       // id тестового задания
+  after:     string[];     // lpstat -v после перевода
+  scanners:  string[];     // scanimage -L
+}
+
+/** lpoptions всех пользователей и системный — там запомнен выбранный принтер. */
+export function lpoptionsFiles(): string[] {
+  const files = [CUPS_LPOPTS, '/root/.cups/lpoptions'];
+  try {
+    for (const h of readdirSync('/home')) files.push(`/home/${h}/.cups/lpoptions`);
+  } catch { /* нет /home */ }
+  return files.filter(f => readFile(f) !== null);
+}
+
+/** Убирает из lpoptions строки Default/Dest удалённых очередей. */
+export function stripLpoptions(text: string, removed: string[]): string {
+  const set = new Set(removed);
+  return text.split('\n')
+    .filter(l => { const m = l.match(/^(?:Default|Dest)\s+([^\s/]+)/); return !(m && set.has(m[1])); })
+    .join('\n');
+}
+
+export function rollbackScript(backupDir: string, maskedUnits: string[], removedPkgs: string[]): string {
   return [
     '#!/usr/bin/env bash',
-    '# Откат режима «только один МФУ», созданного утилитой redos.',
+    '# Откат перевода на driverless (IPP Everywhere), выполненного утилитой redos.',
     'set -e',
     `BK="${backupDir}"`,
-    `[ -f "$BK/dll.conf" ]     && cp -a "$BK/dll.conf"     ${SANE_DLL}`,
-    `[ -f "$BK/airscan.conf" ] && cp -a "$BK/airscan.conf" ${SANE_AIRSCAN}`,
-    `[ -f "$BK/lpoptions" ]    && cp -a "$BK/lpoptions"    ${CUPS_LPOPTS} || rm -f ${CUPS_LPOPTS}`,
-    '[ -d "$BK/dll.d" ] && { rm -rf /etc/sane.d/dll.d; cp -a "$BK/dll.d" /etc/sane.d/dll.d; }',
-    ...(keptAvahi ? [] : [
-      'systemctl unmask avahi-daemon.socket avahi-daemon.service || true',
-      'systemctl enable --now avahi-daemon.socket avahi-daemon.service || true',
-    ]),
+    'tar -C / -xzf "$BK/etc.tgz"',
+    ...(maskedUnits.length ? [
+      `systemctl unmask ${maskedUnits.join(' ')} || true`,
+      `systemctl enable --now ${maskedUnits.join(' ')} || true`,
+    ] : []),
     'systemctl restart cups',
-    'echo "Откат выполнен. Удалённые очереди печати восстановите вручную."',
+    ...(removedPkgs.length ? [`echo "hplip был удалён. Вернуть: dnf install ${removedPkgs.join(' ')}"`] : []),
+    'echo "Откат выполнен."',
     '',
   ].join('\n');
 }
 
-// ─── состояние режима «только один МФУ» ──────────────────────────────────────
-
-export interface SingleMfpState {
-  active:      boolean;  // конфиги SANE управляются нами (есть наш маркер)
-  /**
-   * IP сканера из airscan.conf — независимо от того, кто его туда записал.
-   * Нужен, чтобы подставить адрес по умолчанию в форму, когда режим ещё
-   * не включён, но сканер в системе уже настроен вручную.
-   */
-  scannerIp:   string;
-  avahiMasked: boolean;
+/** cupsd после cupsctl/restart какое-то время не принимает запросы. */
+async function waitCups(timeoutMs = 30_000): Promise<boolean> {
+  const until = Date.now() + timeoutMs;
+  while (Date.now() < until) {
+    const r = await runPty(['lpstat', '-r'], { env: C_LOCALE, timeoutMs: 5000 });
+    if (r.code === 0 && /is running/.test(r.output)) return true;
+    await sleep(1000);
+  }
+  return false;
 }
 
-export async function readSingleMfpState(): Promise<SingleMfpState> {
-  const air = readFile(SANE_AIRSCAN) ?? '';
-  const dll = readFile(SANE_DLL) ?? '';
-  const active = air.includes(HEADER_MARK) && dll.includes(HEADER_MARK);
+async function writeRoot(file: string, content: string): Promise<FixResult> {
+  if (isRoot()) {
+    try { await Bun.write(file, content); return { ok: true, msg: '' }; }
+    catch (e) { return { ok: false, msg: (e as Error).message }; }
+  }
+  const { writeSudo } = await import('../utils/sudo');
+  return writeSudo(file, content);
+}
 
-  const avahi = await runPtyLines(['systemctl', 'is-enabled', 'avahi-daemon.service'],
-                                  { env: C_LOCALE, timeoutMs: 8000 });
-  return {
-    active,
-    scannerIp:   ipFromUri(air),
-    avahiMasked: avahi.some(l => l.trim() === 'masked'),
-  };
+/** Печатает тестовую страницу и ждёт, пока задание уйдёт на МФУ. */
+async function printTestPage(queue: string, step: (m: string) => void): Promise<{ ok: boolean; job: string; msg: string }> {
+  if (!await waitCups()) return { ok: false, job: '', msg: 'cupsd не отвечает' };
+
+  let file = CUPS_TESTPAGE;
+  if (readFile(file) === null) {
+    file = `/tmp/redos-testpage-${process.pid}.txt`;
+    await Bun.write(file, `Тестовая страница redos — ${new Date().toLocaleString('ru-RU')}\n` +
+                          `Очередь: ${queue} (IPP Everywhere)\n`);
+  }
+  const r = await sys(['lp', '-d', queue, '-t', 'redos driverless test', file], 30_000);
+  const job = r.msg.match(new RegExp(`${escapeRe(queue)}-\\d+`))?.[0] ?? '';
+  if (!r.ok || !job) return { ok: false, job: '', msg: `lp: ${r.msg || 'задание не создано'}` };
+
+  step(`Задание ${job} отправлено, жду завершения...`);
+  const until = Date.now() + 120_000;
+  while (Date.now() < until) {
+    const pending = await lines(['lpstat', '-W', 'not-completed', '-o', queue], 10_000);
+    if (!pending.some(l => l.startsWith(job + ' '))) break;
+    await sleep(2000);
+  }
+  const [pending, printer] = await Promise.all([
+    lines(['lpstat', '-W', 'not-completed', '-o', queue], 10_000),
+    lines(['lpstat', '-p', queue], 10_000),
+  ]);
+  if (pending.some(l => l.startsWith(job + ' ')))
+    return { ok: false, job, msg: `задание ${job} не завершилось за 2 минуты` };
+  if (printer.some(l => /disabled|stopped/i.test(l)))
+    return { ok: false, job, msg: 'очередь остановилась после тестового задания' };
+  return { ok: true, job, msg: `задание ${job} выполнено` };
+}
+
+export async function migrate(
+  s: SystemState, o: MigrateOptions, probe: PrinterProbe, onStep: (m: string) => void = () => {},
+): Promise<MigrateResult> {
+  const res: MigrateResult = { ok: false, lines: [], backupDir: '', testJob: '', after: [], scanners: [] };
+  const done = (m: string) => res.lines.push('✓ ' + m);
+  const fail = (m: string) => { res.lines.push('✗ ' + m); return res; };
+  const note = (m: string) => res.lines.push('• ' + m);
+
+  const block = migrationBlocker(probe);
+  if (block) return fail(block);
+  const plan = new Set(planMigration(s, o).map(p => p.id));
+  const uri = `ipp://${o.ip}/ipp/print`;
+
+  // 1. бэкап
+  const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15);
+  res.backupDir = `/root/redos-printer-backup-${stamp}`;
+  onStep(`Бэкап в ${res.backupDir}`);
+  const mk = await sys(['mkdir', '-p', res.backupDir]);
+  if (!mk.ok) return fail(`не удалось создать ${res.backupDir}: ${mk.msg}`);
+  const userOpts = lpoptionsFiles().filter(f => f !== CUPS_LPOPTS).map(f => f.slice(1));
+  const tar = await sys(['tar', '-C', '/', '-czf', `${res.backupDir}/etc.tgz`, 'etc/cups', 'etc/sane.d', ...userOpts]);
+  if (!tar.ok) return fail(`бэкап не создан: ${tar.msg}`);
+  const maskUnits = s.units.filter(u => u.enabled !== 'not-found' && u.enabled !== '' && u.enabled !== 'masked').map(u => u.unit);
+  await writeRoot(`${res.backupDir}/rollback.sh`, rollbackScript(
+    res.backupDir, o.hideDiscovery ? maskUnits : [], o.removeHplip ? s.hplip : []));
+  await sys(['chmod', '+x', `${res.backupDir}/rollback.sh`]);
+  done(`бэкап: ${res.backupDir}`);
+
+  // 2. очередь
+  onStep(`Очередь ${o.queueName} → ${uri} (lpadmin опрашивает МФУ)...`);
+  const la = await sys(['lpadmin', '-p', o.queueName, '-E', '-v', uri, '-m', 'everywhere',
+    '-L', o.ip,
+    '-o', 'printer-error-policy=retry-job',
+    '-o', 'sides-default=one-sided',
+    '-o', 'Duplex=None'], 90_000);
+  if (!la.ok) return fail(`lpadmin: ${la.msg}`);
+  await sys(['cupsenable', o.queueName]);
+  await sys(['cupsaccept', o.queueName]);
+  await sys(['lpadmin', '-d', o.queueName]);
+  done(`очередь ${o.queueName}: IPP Everywhere, retry-job, односторонняя, по умолчанию`);
+
+  // 3. лишние очереди
+  if (plan.has('remove-queues')) {
+    const removed: string[] = [];
+    for (const q of queuesToRemove(s.queues, o)) {
+      onStep(`Удаляю очередь ${q.name}`);
+      if ((await sys(['lpadmin', '-x', q.name])).ok) removed.push(q.name);
+      else note(`очередь ${q.name} удалить не удалось`);
+    }
+    for (const f of lpoptionsFiles()) {
+      const text = readFile(f) ?? '';
+      const next = stripLpoptions(text, removed);
+      if (next !== text) await writeRoot(f, next);
+    }
+    if (removed.length) done(`удалены очереди: ${removed.join(', ')}`);
+  }
+
+  // 4. автообнаружение
+  if (plan.has('discovery')) {
+    for (const u of s.units) {
+      if (u.enabled === 'not-found' || u.enabled === '') continue;
+      if (u.enabled === 'masked' && !u.active) continue;
+      onStep(`Отключаю ${u.unit}`);
+      await sys(['systemctl', 'stop', u.unit]);
+      if (u.enabled !== 'masked') {
+        await sys(['systemctl', 'disable', '-q', u.unit]);
+        await sys(['systemctl', 'mask', '-q', u.unit]);
+      }
+    }
+    if (s.sharing !== 'off') {
+      onStep('Выключаю общий доступ к принтерам (cupsd перезапустится)');
+      await sys(['cupsctl', '--no-share-printers', '--no-remote-any']);
+      await waitCups();
+    }
+    done('автообнаружение принтеров отключено');
+  }
+
+  // 5. сканер
+  if (plan.has('airscan-install')) {
+    onStep('Устанавливаю sane-airscan...');
+    const r = await sys(['dnf', 'install', '-y', 'sane-airscan'], 600_000);
+    r.ok ? done('установлен sane-airscan') : note(`sane-airscan не установлен: ${r.msg}`);
+  }
+  if (plan.has('airscan')) {
+    onStep(`Сканер по eSCL: ${o.ip}`);
+    const name = `${probe.ipp?.model || 'Сетевой МФУ'} (${o.ip})`;
+    const w = await writeRoot(SANE_AIRSCAN, airscanConf(name, o.ip));
+    w.ok ? done(`сканер: ${name}`) : note(`${SANE_AIRSCAN}: ${w.msg}`);
+  }
+
+  // 6. тестовая страница — от неё зависит удаление hplip
+  let printed = !o.testPage;
+  if (plan.has('test-page')) {
+    onStep('Тестовая страница...');
+    const t = await printTestPage(o.queueName, onStep);
+    res.testJob = t.job;
+    printed = t.ok;
+    t.ok ? done(`тестовая страница: ${t.msg} — проверьте лист в лотке`) : note(`тестовая страница: ${t.msg}`);
+  }
+
+  // 7. hplip
+  if (plan.has('hplip')) {
+    if (!printed) {
+      note('hplip НЕ удалён: тестовая печать не прошла. Разберитесь с печатью и повторите перевод.');
+    } else {
+      onStep('Останавливаю hp-systray');
+      await sys(['pkill', '-f', 'hp-systray']);
+      onStep(`Удаляю ${s.hplip.join(' ')} (dnf)...`);
+      const r = await sys(['dnf', 'remove', '-y', ...s.hplip], 600_000);
+      if (r.ok) {
+        done(`hplip удалён: ${s.hplip.join(', ')}`);
+        try {
+          for (const h of readdirSync('/home')) {
+            const f = `/home/${h}/.config/autostart/hplip-systray.desktop`;
+            if (readFile(f) !== null) await sys(['rm', '-f', f]);
+          }
+        } catch { /* нет /home */ }
+      } else {
+        note(`dnf remove: ${r.msg}`);
+      }
+    }
+  }
+
+  // 8. итог
+  onStep('Проверяю результат...');
+  res.after = (await lines(['lpstat', '-v'])).filter(l => l.trim());
+  if (o.scanner) {
+    res.scanners = (await lines(['scanimage', '-L'], 70_000))
+      .filter(l => /^device /.test(l.trim()));
+  }
+  res.ok = !res.lines.some(l => l.startsWith('✗'));
+  return res;
+}
+
+// ─── поиск МФУ ────────────────────────────────────────────────────────────────
+
+export interface Candidate {
+  ip:     string;
+  source: string;  // откуда известен: очередь, airscan.conf, mDNS, CUPS
+}
+
+/**
+ * Адреса, на которые можно перевести: из очередей и airscan.conf (самые
+ * надёжные), затем mDNS — если avahi ещё работает — и lpinfo.
+ */
+export async function findCandidates(s: SystemState, onStep: (m: string) => void = () => {}): Promise<Candidate[]> {
+  const out = new Map<string, string>();
+  for (const q of s.queues) if (q.ip && !out.has(q.ip)) out.set(q.ip, `очередь ${q.name}`);
+  if (s.airscan.ip && !out.has(s.airscan.ip)) out.set(s.airscan.ip, 'airscan.conf');
+
+  if (s.units.some(u => u.unit.startsWith('avahi') && u.active)) {
+    onStep('Опрашиваю mDNS (avahi-browse)...');
+    // =;eth0;IPv4;HP%20LaserJet;_ipp._tcp;local;printer.local;10.82.230.22;631;"txt"
+    for (const svc of ['_ipp._tcp', '_uscan._tcp']) {
+      for (const l of await lines(['avahi-browse', '-rtp', svc], 15_000)) {
+        if (!l.startsWith('=')) continue;
+        const ip = l.split(';')[7]?.trim() ?? '';
+        if (isIpv4(ip) && !out.has(ip)) out.set(ip, 'mDNS');
+      }
+    }
+  }
+
+  onStep('Смотрю, что видит CUPS (lpinfo -v)...');
+  for (const l of await lines(['lpinfo', '-v'], 25_000)) {
+    const ip = ipFromUri(l);
+    if (ip && !out.has(ip)) out.set(ip, 'CUPS');
+  }
+  return [...out].map(([ip, source]) => ({ ip, source }));
 }

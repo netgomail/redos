@@ -18,7 +18,7 @@ export const COMMANDS: CommandDef[] = [
   { name: '/install',       description: 'установка сторонних программ (АС Смета и другие)', showInTips: true },
   { name: '/inventory',     description: 'инвентаризация системы', usage: '/inventory [файл.txt]', showInTips: true },
   { name: '/passwd-policy', description: 'парольная политика — сложность и срок смены', showInTips: true },
-  { name: '/printer',       description: 'печать и сканирование — лечение очереди, только один МФУ', showInTips: true },
+  { name: '/printer',       description: 'печать и сканирование — перевод МФУ на driverless (IPP Everywhere)', showInTips: true },
   { name: '/usb-policy',    description: 'контроль USB-устройств: категории и исключения', showInTips: true },
   { name: '/quit',          description: 'завершить работу' },
 ];
