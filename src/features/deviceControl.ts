@@ -15,9 +15,15 @@
  * USBGuard в with-interface, поэтому набор категорий переносится без потерь.
  *
  * Модель — белый список: разрешено то, что выбрано, всё прочее блокируется.
- * Проверка идёт по ВСЕМ интерфейсам устройства сразу (семантика match-all у
- * USBGuard): иначе композитное устройство {08, 03} прошло бы по разрешённому
- * HID и протащило накопитель.
+ * Проверка идёт по ВСЕМ интерфейсам устройства сразу: иначе композитное
+ * устройство {08, 03} прошло бы по разрешённому HID и протащило накопитель.
+ *
+ * С одной оговоркой. Блокирует интерфейс, чей класс относится к выключенной
+ * категории; класс, не покрытый категориями вовсе (вендорский ff), устройство
+ * не блокирует — разрешить его всё равно нечем, галочки для него нет. Без
+ * оговорки не работал ни один принтер HP: он объявляет 07 и рядом свой ff, и
+ * запрет срабатывал даже при всех включённых категориях. Пройти по одному ff
+ * устройство не может: нужен хотя бы один интерфейс из разрешённых.
  *
  * Три файла на машине:
  *   /etc/udev/rules.d/99-block-usb.rules   правило: вызвать скрипт на событии
@@ -85,10 +91,12 @@ function removeLegacyFiles(): number {
  * категория прочитается как запрещённая, хотя запрещали не её.
  *
  * Версия 2 — udev-политика; 1 была у файла правил USBGuard. Версия 3 добавила
- * второй рубеж по блочному узлу и опознание накопителя по SCSI-переносу:
- * обе живут в скрипте и правиле, поэтому старую установку нужно переприменить.
+ * второй рубеж по блочному узлу и опознание накопителя по SCSI-переносу.
+ * Версия 4 перестала блокировать устройство из-за класса, не покрытого ни
+ * одной категорией, — из-за него не проходил ни один принтер HP. Всё это
+ * живёт в скрипте и правиле, поэтому старую установку нужно переприменить.
  */
-const POLICY_VERSION  = 3;
+const POLICY_VERSION  = 4;
 const VERSION_MARK    = '# redos-device-control-version:';
 const CATEGORIES_MARK = '# redos-device-control-categories:';
 // ─── категории устройств ─────────────────────────────────────────────────────
@@ -243,6 +251,23 @@ export const LOCKED_CATEGORIES: CategoryId[] = CATEGORIES.filter(c => c.locked).
 
 /** Категории, которые администратор действительно выбирает. */
 export const SELECTABLE_CATEGORIES: Category[] = CATEGORIES.filter(c => !c.locked);
+
+/**
+ * Классы интерфейсов, покрытые хоть какой-нибудь категорией.
+ *
+ * Отделяют запрет от непокрытости. Класс выключенной категории — осознанное
+ * решение администратора, и устройство с таким интерфейсом блокируется.
+ * Класс, которого в категориях нет вовсе, — это вендорский ff и подобные:
+ * включить их нечем, галочки для них не существует.
+ *
+ * Различие появилось из-за принтеров. HP объявляет, кроме 07, ещё и
+ * проприетарный ff — и при проверке «все интерфейсы должны быть разрешены»
+ * ни один аппарат HP не проходил даже при всех включённых категориях, хотя
+ * «Принтеры» стоят в locked как рабочая необходимость.
+ */
+export const KNOWN_CLASSES: string[] = [...new Set(
+  CATEGORIES.flatMap(c => c.classes).map(p => p.split(':')[0]!.toLowerCase()),
+)].sort();
 
 /** Совпадает ли идентификатор устройства с шаблоном вида "0a89:*". */
 function idMatches(deviceId: string, pattern: string): boolean {
@@ -452,19 +477,31 @@ export function explainPolicy(d: UsbDevice, allowed: Set<CategoryId>): string {
   }
 
   const active = CATEGORIES.filter(c => c.locked || allowed.has(c.id));
-  const isStorage = ifaces.some(i => i.split(':')[0].toLowerCase() === STORAGE_CLASS);
-  if (!isStorage && active.some(c => c.ids?.some(pat => idMatches(d.deviceId, pat)))) {
+  const classes = ifaces.map(effectiveClass);
+  const has = (c: string) => classes.includes(c);
+
+  if (has(STORAGE_CLASS) && (has('03') || has('02') || has('e0'))) {
+    return 'накопитель вместе с клавиатурой, сетевой картой или радиомодулем — ' +
+           'такое устройство блокируется независимо от категорий';
+  }
+  if (!has(STORAGE_CLASS) && active.some(c => c.ids?.some(pat => idMatches(d.deviceId, pat)))) {
     return 'разрешено по идентификатору: криптотокен';
   }
 
   const stale = SOURCE_NOTE[source];
-  const problems: string[] = [];
+  const known = new Set(KNOWN_CLASSES);
+  const blocking:  string[] = [];   // класс выключенной категории — причина блокировки
+  const uncovered: string[] = [];   // класс вне категорий — сам по себе не блокирует
+  let anyAllowed = false;
   const seen = new Set<string>();
   for (const iface of ifaces) {
     const cls = effectiveClass(iface);
+    if (active.some(c => c.classes.some(p => p.split(':')[0].toLowerCase() === cls))) {
+      anyAllowed = true;
+      continue;
+    }
     if (seen.has(cls)) continue;
     seen.add(cls);
-    if (active.some(c => c.classes.some(p => p.split(':')[0].toLowerCase() === cls))) continue;
 
     // Заявленный класс называем как есть, а если решение приняли не по нему —
     // говорим об этом прямо: иначе строка спорит с колонкой типа.
@@ -473,16 +510,21 @@ export function explainPolicy(d: UsbDevice, allowed: Set<CategoryId>): string {
       ? `${cls} — ${CLASS_NAMES[cls] ?? 'неизвестный класс'}`
       : `${iface} — накопитель по SCSI-переносу, хоть и класс ${declared}`;
 
-    // Класс, который вообще не покрыт категориями, включением галочки не
-    // разрешить: для него есть только поимённое исключение.
     const owner = CATEGORIES.find(c => c.classes.some(p => p.split(':')[0].toLowerCase() === cls));
-    problems.push(owner
-      ? `${name}: категория «${owner.title}» выключена`
-      : `${name}: ни одна категория его не покрывает — только поимённо`);
+    if (owner && known.has(cls)) blocking.push(`${name}: категория «${owner.title}» выключена`);
+    else uncovered.push(name);
   }
 
-  if (problems.length === 0) return `все интерфейсы разрешены категориями${stale}`;
-  return problems.join('; ') + stale;
+  // Порядок ответа — от того, что решает, к тому, что просто стоит знать.
+  if (blocking.length) return blocking.join('; ') + stale;
+  if (!anyAllowed) {
+    return `${uncovered.join('; ')}: ни одна категория его не покрывает — только поимённо${stale}`;
+  }
+  if (uncovered.length) {
+    return `разрешено по категориям; ${uncovered.join('; ')} — вне категорий, ` +
+           `но устройство из-за него не блокируется${stale}`;
+  }
+  return `все интерфейсы разрешены категориями${stale}`;
 }
 
 // ─── чтение sysfs ────────────────────────────────────────────────────────────
@@ -812,23 +854,36 @@ function saveRemembered(devices: UsbDevice[]): void {
 /**
  * Пропустит ли устройство политика при таком наборе разрешённых категорий.
  *
- * Повторяет семантику сгенерированных правил: match-all по классам плюс
- * разрешение по идентификатору для категорий вроде криптотокенов. Нужна,
- * чтобы показывать в списке только те устройства, судьбу которых
+ * Повторяет семантику сгенерированных правил: опасные комбинации, разрешение
+ * по идентификатору для категорий вроде криптотокенов и проверку классов.
+ * Нужна, чтобы показывать в списке только те устройства, судьбу которых
  * администратор ещё должен решить.
  */
 export function allowedByCategories(d: UsbDevice, allowed: Set<CategoryId>): boolean {
-  const active = CATEGORIES.filter(c => c.locked || allowed.has(c.id));
+  const active  = CATEGORIES.filter(c => c.locked || allowed.has(c.id));
+  const classes = d.interfaces.map(effectiveClass);
+  const has = (c: string) => classes.includes(c);
+
+  // Опасные комбинации (BadUSB) — до разрешений, как в скрипте: накопитель,
+  // притворяющийся ещё и клавиатурой, сетевой картой или радиомодулем, иначе
+  // прошёл бы по разрешённой категории.
+  if (has(STORAGE_CLASS) && (has('03') || has('02') || has('e0'))) return false;
 
   // Категории, опознаваемые по идентификатору (токены), — отдельным правилом.
   // Условие none-of { 08:*:* } из правил повторяем здесь: устройство с
   // накопительным интерфейсом по идентификатору токена не проходит.
-  const isStorage = d.interfaces.some(i => effectiveClass(i) === STORAGE_CLASS);
-  if (!isStorage && active.some(c => c.ids?.some(pat => idMatches(d.deviceId, pat)))) return true;
+  if (!has(STORAGE_CLASS) && active.some(c => c.ids?.some(pat => idMatches(d.deviceId, pat)))) return true;
 
-  if (d.interfaces.length === 0) return false;
-  const classes = new Set(active.flatMap(c => c.classes).map(p => p.split(':')[0].toLowerCase()));
-  return d.interfaces.every(i => classes.has(effectiveClass(i)));
+  if (classes.length === 0) return false;
+  const ok    = new Set(active.flatMap(c => c.classes).map(p => p.split(':')[0].toLowerCase()));
+  const known = new Set(KNOWN_CLASSES);
+
+  // Блокирует интерфейс выключенной категории. Интерфейс, чей класс не
+  // покрыт категориями, сам по себе не блокирует — иначе принтер с
+  // вендорским ff не разрешить никакой галочкой. Но и разрешать устройство
+  // ему нечем: нужен хотя бы один интерфейс из разрешённой категории,
+  // поэтому флешка, замаскированная под сплошной ff, по-прежнему не пройдёт.
+  return classes.some(c => ok.has(c)) && classes.every(c => ok.has(c) || !known.has(c));
 }
 
 /**
@@ -900,8 +955,10 @@ export function generatePolicy(input: PolicyInput): string {
     `# Сгенерировано: ${new Date().toISOString()}`,
     '#',
     '# ALLOWED_CLASSES — классы интерфейсов USB, которые политика пропускает.',
-    '#   Устройство проходит, только если В НЁМ РАЗРЕШЕНЫ ВСЕ интерфейсы:',
-    '#   иначе связка {накопитель, клавиатура} прошла бы по разрешённому HID.',
+    '#   Устройство проходит, если разрешён хотя бы один его интерфейс и ни',
+    '#   один не относится к выключенной категории: иначе связка {накопитель,',
+    '#   клавиатура} прошла бы по разрешённому HID. Классы вне категорий',
+    '#   (вендорский ff у принтеров) не блокируют — включить их нечем.',
     '# TOKEN_IDS — криптотокены, разрешённые по идентификатору. Условие «не',
     '#   объявляет накопитель» проверяет скрипт: VID подделывается тривиально,',
     '#   и без него хватило бы перешить флешку, чтобы обойти запрет.',
@@ -1053,6 +1110,9 @@ if [ "$1" = --storage ]; then mode=storage; shift; fi
 conf=${POLICY_FILE}
 [ -r "$conf" ] || exit 0
 
+# Разрешённое читается из политики, а перечень классов, вообще покрытых
+# категориями, вшит в скрипт: он не зависит от выбора администратора и
+# меняется только вместе с самими категориями, то есть с этим файлом.
 allowed=$(sed -n 's/^ALLOWED_CLASSES=//p' "$conf")
 tokens=$(sed -n 's/^TOKEN_IDS=//p' "$conf")
 trusted=$(sed -n 's/^TRUSTED=//p' "$conf")
@@ -1152,13 +1212,26 @@ if ! has 08; then
   done
 fi
 
-# 3. Все интерфейсы должны попадать в разрешённые классы (match-all).
+# 3. Решение по классам интерфейсов.
+#
+#    Блокирует класс выключенной категории. Класс, не покрытый категориями
+#    вовсе (вендорский ff у принтеров и МФУ), сам по себе не блокирует: его
+#    не разрешить ни одной галочкой, и при прежней проверке «все интерфейсы
+#    разрешены» ни один HP не проходил даже с включёнными «Принтерами».
+#
+#    Разрешать устройство непокрытому классу тоже нечем, поэтому нужен хотя
+#    бы один интерфейс из разрешённых: устройство целиком из ff не пройдёт.
+ok=no
 for c in $classes; do
   case " $allowed " in
-    *" $c "*) ;;
-    *) block ;;
+    *" $c "*) ok=yes; continue ;;
+  esac
+  # Класс относится к категории, которую администратор выключил.
+  case " ${KNOWN_CLASSES.join(' ')} " in
+    *" $c "*) block ;;
   esac
 done
+[ "$ok" = yes ] || block
 exit 0
 `;
 

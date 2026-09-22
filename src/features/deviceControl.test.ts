@@ -124,6 +124,30 @@ describe('категории устройства', () => {
     expect(allowedByCategories(composite, new Set(['storage', 'video']))).toBe(true);
   });
 
+  test('вендорский интерфейс рядом с разрешённым не блокирует принтер', () => {
+    // HP объявляет 07 и рядом свой ff. Категория «Принтеры» — locked, то есть
+    // разрешена всегда, и аппарат обязан проходить при любой политике.
+    expect(allowedByCategories(dev(['07:01:02', 'ff:cc:00']), new Set())).toBe(true);
+    expect(allowedByCategories(dev(['07:01:02', '07:01:04', 'ff:ff:ff']), new Set())).toBe(true);
+  });
+
+  test('вендорский интерфейс не спасает выключенную категорию', () => {
+    // Тот же принтер, но со слотом карт: 08 при запрещённых накопителях
+    // блокирует, и «зато есть ff» тут ничего не меняет.
+    expect(allowedByCategories(dev(['07:01:02', '08:06:50', 'ff:cc:00']), new Set())).toBe(false);
+    expect(allowedByCategories(dev(['07:01:02', '08:06:50', 'ff:cc:00']), new Set(['storage']))).toBe(true);
+  });
+
+  test('одного вендорского класса мало, чтобы пройти', () => {
+    // Разрешать нечем: ни один интерфейс не попадает в категорию.
+    expect(allowedByCategories(dev(['ff:ff:ff']), new Set(['storage', 'video']))).toBe(false);
+  });
+
+  test('накопитель с клавиатурой блокируется и при разрешённых категориях', () => {
+    // Повторяет правило 1 скрипта: BadUSB проверяется до разрешений.
+    expect(allowedByCategories(dev(['08:06:50', '03:00:01']), new Set(['storage']))).toBe(false);
+  });
+
   test('всегда разрешённый класс не тянет за собой выключенный', () => {
     // Клавиатура (03) разрешена всегда, накопитель (08) — нет
     expect(allowedByCategories(dev(['08:06:50', '03:00:01']), new Set())).toBe(false);
@@ -233,6 +257,31 @@ describe('скрипт решения', () => {
     expect(decide({
       interfaces: ['08', '03'],
       policyText: generatePolicy(policy({ allowed: ['storage'] })),
+    })).toBe('block');
+  });
+
+  test('принтер с вендорским интерфейсом проходит при пустой политике', () => {
+    // Ровно то, из-за чего ни один HP не работал: 07 разрешён всегда,
+    // а ff не покрыт категориями и блокировать не должен.
+    expect(decide({
+      interfaces: ['07:01:02', 'ff:cc:00'],
+      policyText: generatePolicy(policy()),
+    })).toBe('allow');
+  });
+
+  test('принтер со слотом карт подчиняется запрету накопителей', () => {
+    const ifaces = ['07:01:02', '08:06:50', 'ff:cc:00'];
+    expect(decide({ interfaces: ifaces, policyText: generatePolicy(policy()) })).toBe('block');
+    expect(decide({
+      interfaces: ifaces,
+      policyText: generatePolicy(policy({ allowed: ['storage'] })),
+    })).toBe('allow');
+  });
+
+  test('устройство из одного вендорского класса не проходит', () => {
+    expect(decide({
+      interfaces: ['ff:ff:ff'],
+      policyText: generatePolicy(policy({ allowed: ['storage', 'video'] })),
     })).toBe('block');
   });
 
