@@ -2,12 +2,14 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Box, Text, useInput, useStdout } from 'ink';
 import { Spinner } from './Spinner';
 import {
-  readSystemState, diagnose, restoreQueue, findCandidates, probePrinter,
-  planMigration, migrate, migrationBlocker, defaultQueueName,
-  discoveryHidden, isHplipBackend, isDriverless, isIpv4,
+  readSystemState, diagnose, restoreQueue, clearQueue, closeQueue,
+  findCandidates, probePrinter, planMigration, migrate, migrationBlocker,
+  defaultQueueName, discoveryHidden, isHplipBackend, isDriverless, isIpv4,
+  connLabel, connKey, hplipKept, duplicateJobs, queueNameError,
 } from '../features/printer';
+import { usbPrinterName } from '../features/usbPrinter';
 import type {
-  SystemState, PrintQueue, Diagnosis, Candidate, PrinterProbe,
+  SystemState, PrintQueue, Diagnosis, Candidate, PrinterProbe, Conn,
   MigrateOptions, MigrateResult,
 } from '../features/printer';
 
@@ -25,7 +27,7 @@ type Phase =
   | 'running'    // живой лог шагов
   | 'result';
 
-type ActionId = 'diagnose' | 'migrate' | 'restore' | 'refresh';
+type ActionId = 'diagnose' | 'migrate' | 'restore' | 'clear' | 'close' | 'refresh';
 
 interface Action {
   id:    ActionId;
@@ -38,9 +40,15 @@ const ACTIONS: Action[] = [
   { id: 'diagnose', needsQueue: true,  title: 'Диагностика очереди',
     hint: 'очередь, состояние МФУ по IPP (ошибки, тонер), сеть, сбои hplip в журнале cups' },
   { id: 'migrate',  needsQueue: false, title: 'Перевести на driverless (IPP Everywhere)...',
-    hint: 'очередь ipp://IP/ipp/print без hplip, retry-job, сканер по eSCL, тестовая печать, удаление hplip' },
+    hint: 'очередь по IPP без hplip (сеть — по IP, USB — через ipp-usb), retry-job, ' +
+          'сканер по eSCL, тестовая печать, удаление hplip' },
   { id: 'restore',  needsQueue: true,  title: 'Включить остановленную очередь',
     hint: 'cupsenable, cupsaccept, retry-job, снять застрявшие задания — бэкенд не меняется' },
+  { id: 'clear',    needsQueue: true,  title: 'Очистить очередь',
+    hint: 'cancel -a: снять все задания, ничего больше не менять' },
+  { id: 'close',    needsQueue: true,  title: 'Закрыть очередь (принтер в ремонте)',
+    hint: 'cupsreject и снять задания: пользователь получает отказ сразу и перестаёт ' +
+          'досылать копии одного документа' },
   { id: 'refresh',  needsQueue: false, title: 'Обновить',
     hint: 'перечитать состояние' },
 ];
@@ -51,10 +59,20 @@ const OPT_TITLES: Record<OptKey, string> = {
   testPage:      'тестовая страница перед удалением hplip',
   removeHplip:   'удалить hplip',
   hideDiscovery: 'отключить автообнаружение (cups-browsed, avahi, общий доступ)',
-  scanner:       'сканер по eSCL (sane-airscan, IP, без автопоиска)',
+  scanner:       'сканер по eSCL (sane-airscan по адресу, без автопоиска)',
   removeOthers:  'удалить и все остальные очереди',
 };
 const OPT_KEYS = Object.keys(OPT_TITLES) as OptKey[];
+
+/**
+ * Строки экрана параметров: имя очереди и переключатели.
+ *
+ * Имя стоит первым и редактируется: под ним печатают, его видят в списке
+ * принтеров, и менять его после перевода — значит заново объяснять это всем
+ * пользователям. Подставляется прежнее, но слово остаётся за администратором.
+ */
+const OPT_ROWS = ['name', ...OPT_KEYS] as const;
+type OptRow = typeof OPT_ROWS[number];
 
 interface ResultView { ok: boolean; title: string; lines: string[] }
 
@@ -85,6 +103,7 @@ export function PrinterScreen({ onExit }: Props) {
   const [opts, setOpts] = useState<MigrateOptions | null>(null);
   const [optIdx, setOptIdx] = useState(0);
   const [optionsBack, setOptionsBack] = useState<Phase>('pick');
+  const [editingName, setEditingName] = useState(false);
 
   const [log, setLog] = useState<string[]>([]);
   const [runTitle, setRunTitle] = useState('');
@@ -114,8 +133,10 @@ export function PrinterScreen({ onExit }: Props) {
 
   const doDiagnose = async (q: PrintQueue) => {
     startRun(`Диагностика: ${q.name}`);
-    step(q.ip ? `Опрашиваю очередь, МФУ ${q.ip} по IPP и журнал cups...` : 'Опрашиваю очередь и журнал cups...');
-    const d = await diagnose(q);
+    step(q.conn === 'other'
+      ? 'Опрашиваю очередь и журнал cups...'
+      : `Опрашиваю очередь, аппарат (${q.conn === 'usb' ? 'USB' : q.ip}) по IPP и журнал cups...`);
+    const d = await diagnose(q, sys?.usb ?? []);
     if (!alive.current) return;
     setDiag(d);
     setPhase('diagnosis');
@@ -124,6 +145,22 @@ export function PrinterScreen({ onExit }: Props) {
   const doRestore = async (q: PrintQueue) => {
     startRun(`Восстановление очереди: ${q.name}`);
     const r = await restoreQueue(q, step);
+    if (!alive.current) return;
+    setResult({ ok: r.ok, title: `Очередь ${q.name}`, lines: r.msg.split('; ') });
+    setPhase('result');
+  };
+
+  const doClear = async (q: PrintQueue) => {
+    startRun(`Очистка очереди: ${q.name}`);
+    const r = await clearQueue(q, step);
+    if (!alive.current) return;
+    setResult({ ok: r.ok, title: `Очередь ${q.name}`, lines: r.msg.split('; ') });
+    setPhase('result');
+  };
+
+  const doClose = async (q: PrintQueue) => {
+    startRun(`Закрытие очереди: ${q.name}`);
+    const r = await closeQueue(q, step);
     if (!alive.current) return;
     setResult({ ok: r.ok, title: `Очередь ${q.name}`, lines: r.msg.split('; ') });
     setPhase('result');
@@ -142,37 +179,41 @@ export function PrinterScreen({ onExit }: Props) {
       const list = await findCandidates(sys);
       if (!alive.current) return;
       setCands(list);
-      // сначала IP выбранной очереди
-      const i = list.findIndex(c => c.ip === selectedQueue?.ip);
+      // сначала аппарат выбранной очереди
+      const mine = selectedQueue?.ip ? `net:${selectedQueue.ip}` : '';
+      const i = mine ? list.findIndex(c => connKey(c.conn) === mine) : -1;
       setCandIdx(i >= 0 ? i : 0);
       setSearching(false);
     })();
   };
 
-  const openOptions = async (ip: string, back: Phase = 'pick') => {
+  const openOptions = async (conn: Conn, back: Phase = 'pick') => {
     if (!sys) return;
     setOptionsBack(back);
     setPhase('probing');
     setProbe(null);
-    const p = await probePrinter(ip);
+    const p = await probePrinter(conn);
     if (!alive.current) return;
     setProbe(p);
     setOpts({
-      ip,
-      queueName:     defaultQueueName(sys.queues, ip),
+      conn,
+      queueName:     defaultQueueName(sys.queues, conn),
       testPage:      true,
       removeHplip:   sys.hplip.length > 0,
       hideDiscovery: true,
-      scanner:       p.escl,
+      // У USB сканер проверяется только после запуска ipp-usb: до него eSCL
+      // спрашивать негде. Предлагаем настроить — аппарат почти всегда МФУ.
+      scanner:       p.escl || (conn.kind === 'usb' && !p.ippOpen),
       removeOthers:  false,
     });
     setOptIdx(0);
+    setEditingName(false);
     setPhase('options');
   };
 
   const doMigrate = async () => {
     if (!sys || !opts || !probe) return;
-    startRun(`Перевод на driverless: ${opts.ip}`);
+    startRun(`Перевод на driverless: ${connLabel(opts.conn)}`);
     const r: MigrateResult = await migrate(sys, opts, probe, step);
     if (!alive.current) return;
     const lines = [...r.lines];
@@ -180,7 +221,7 @@ export function PrinterScreen({ onExit }: Props) {
     if (r.scanners.length) lines.push('', 'Сканеры:', ...r.scanners.map(l => '  ' + l));
     if (r.backupDir)       lines.push('', `Откат: ${r.backupDir}/rollback.sh`);
     if (r.ok)              lines.push('Дальше: перезагрузка → печать из LibreOffice и браузера под обычным пользователем.');
-    setResult({ ok: r.ok, title: `Перевод на driverless: ${opts.ip}`, lines });
+    setResult({ ok: r.ok, title: `Перевод на driverless: ${connLabel(opts.conn)}`, lines });
     setPhase('result');
   };
 
@@ -190,6 +231,8 @@ export function PrinterScreen({ onExit }: Props) {
       case 'diagnose': doDiagnose(selectedQueue!); break;
       case 'migrate':  openPick(); break;
       case 'restore':  doRestore(selectedQueue!); break;
+      case 'clear':    doClear(selectedQueue!); break;
+      case 'close':    doClose(selectedQueue!); break;
       case 'refresh':  refresh(); break;
     }
   };
@@ -198,7 +241,8 @@ export function PrinterScreen({ onExit }: Props) {
     if (!sys || !probe) return '';
     if (k === 'removeHplip' && sys.hplip.length === 0) return 'не установлен';
     if (k === 'hideDiscovery' && discoveryHidden(sys) && sys.sharing === 'off') return 'уже отключено';
-    if (k === 'scanner' && !probe.escl) return 'МФУ не отвечает по eSCL';
+    if (k === 'scanner' && !probe.escl)
+      return probe.conn.kind === 'usb' && !probe.ippOpen ? 'проверим после запуска ipp-usb' : 'МФУ не отвечает по eSCL';
     return '';
   };
 
@@ -219,21 +263,39 @@ export function PrinterScreen({ onExit }: Props) {
       if (k('q') || key.escape) { setPhase('view'); return; }
       if (key.return && diag) {
         if (diag.advice === 'restore') doRestore(diag.queue);
-        else if (diag.advice === 'migrate' && diag.queue.ip) openOptions(diag.queue.ip, 'diagnosis');
+        else if (diag.advice === 'clear') doClose(diag.queue);
+        // У USB-очереди своего IP нет — аппарат для неё уже опознан пробой.
+        else if (diag.advice === 'migrate' && diag.probe) openOptions(diag.probe.conn, 'diagnosis');
       }
       return;
     }
 
     if (phase === 'options') {
-      if (k('q') || key.escape) { setPhase(optionsBack); return; }
-      if (key.upArrow)   setOptIdx(i => Math.max(0, i - 1));
-      if (key.downArrow) setOptIdx(i => Math.min(OPT_KEYS.length - 1, i + 1));
-      if ((char === ' ' || key.return) && opts) {
-        const kk = OPT_KEYS[optIdx];
-        if (!optDisabled(kk)) setOpts({ ...opts, [kk]: !opts[kk] });
+      // Правка имени перехватывает весь ввод: иначе «d» из имени запустило бы
+      // перевод, а пробел переключил бы параметр.
+      if (editingName && opts) {
+        if (key.return || key.escape) { setEditingName(false); return; }
+        if (key.ctrl && char === 'u') { setOpts({ ...opts, queueName: '' }); return; }
+        if (key.backspace || key.delete) {
+          setOpts({ ...opts, queueName: opts.queueName.slice(0, -1) });
+          return;
+        }
+        if (char && !key.ctrl && !key.meta && char.charCodeAt(0) >= 0x20) {
+          setOpts({ ...opts, queueName: opts.queueName + char });
+        }
         return;
       }
-      if (k('d') && probe && !migrationBlocker(probe)) doMigrate();
+
+      if (k('q') || key.escape) { setPhase(optionsBack); return; }
+      if (key.upArrow)   setOptIdx(i => Math.max(0, i - 1));
+      if (key.downArrow) setOptIdx(i => Math.min(OPT_ROWS.length - 1, i + 1));
+      if ((char === ' ' || key.return) && opts) {
+        const row: OptRow = OPT_ROWS[optIdx];
+        if (row === 'name') { setEditingName(true); return; }
+        if (!optDisabled(row)) setOpts({ ...opts, [row]: !opts[row] });
+        return;
+      }
+      if (k('d') && opts && probe && !migrationBlocker(probe) && !queueNameError(opts.queueName)) doMigrate();
       return;
     }
 
@@ -246,7 +308,7 @@ export function PrinterScreen({ onExit }: Props) {
           const ip = manualIp.trim();
           if (!isIpv4(ip)) { setIpError(ip ? `«${ip}» не похож на IP-адрес` : 'введите IP-адрес МФУ'); return; }
           setIpError('');
-          openOptions(ip);
+          openOptions({ kind: 'net', ip });
           return;
         }
         if (key.ctrl && char === 'u') { setManualIp(''); setIpError(''); return; }
@@ -257,7 +319,7 @@ export function PrinterScreen({ onExit }: Props) {
 
       if (key.upArrow)   setCandIdx(i => Math.max(0, i - 1));
       if (key.downArrow) setCandIdx(i => Math.min(Math.max(0, cands.length - 1), i + 1));
-      if (key.return && cands[candIdx]) openOptions(cands[candIdx].ip);
+      if (key.return && cands[candIdx] && !cands[candIdx].note) openOptions(cands[candIdx].conn);
       return;
     }
 
@@ -335,14 +397,23 @@ export function PrinterScreen({ onExit }: Props) {
   if (phase === 'pick') {
     return (
       <Frame width={width} subtitle="выбор МФУ">
-        <Box paddingLeft={2}><Text color="cyan" bold>── Известные адреса ──</Text></Box>
+        <Box paddingLeft={2}><Text color="cyan" bold>── Найденные аппараты ──</Text></Box>
         {cands.map((c, i) => {
           const cur = pickFocus === 'list' && i === candIdx;
+          const usb = c.conn.kind === 'usb';
           return (
-            <Box key={c.ip} paddingLeft={2}>
-              <Text color={cur ? 'white' : 'gray'}>{cur ? '❯ ' : '  '}</Text>
-              <Text color={cur ? 'white' : 'gray'} bold={cur}>{c.ip.padEnd(16)}</Text>
-              <Text color="gray" dimColor>{c.source}</Text>
+            <Box key={connKey(c.conn)} flexDirection="column">
+              <Box paddingLeft={2}>
+                <Text color={cur ? 'white' : 'gray'}>{cur ? '❯ ' : '  '}</Text>
+                <Text color={c.note ? 'gray' : usb ? 'cyan' : 'green'}>{usb ? 'USB ' : 'сеть '}</Text>
+                <Text color={cur && !c.note ? 'white' : 'gray'} bold={cur} dimColor={!!c.note}>
+                  {truncate(c.label, 34).padEnd(34)}
+                </Text>
+                <Text color="gray" dimColor>{c.source}</Text>
+              </Box>
+              {c.note !== '' && (
+                <Box paddingLeft={7}><Text color="yellow">{truncate(c.note, width - 10)}</Text></Box>
+              )}
             </Box>
           );
         })}
@@ -364,7 +435,7 @@ export function PrinterScreen({ onExit }: Props) {
         <Box paddingLeft={2} marginTop={1}>
           <Text color="gray" dimColor>
             {pickFocus === 'list'
-              ? '↑↓ выбор · Enter проверить МФУ · Tab ввод IP · Esc назад'
+              ? '↑↓ выбор · Enter проверить аппарат · Tab ввод IP · Esc назад'
               : 'цифры и точка · Ctrl+U очистить · Enter проверить МФУ · Tab к списку · Esc назад'}
           </Text>
         </Box>
@@ -374,11 +445,23 @@ export function PrinterScreen({ onExit }: Props) {
 
   if (phase === 'options' && opts && probe) {
     const blocker = migrationBlocker(probe);
-    const plan = planMigration(sys, opts);
+    const nameError = queueNameError(opts.queueName);
+    const plan = nameError ? [] : planMigration(sys, opts, probe);
     const ipp = probe.ipp;
+    // Имя изменили, а очередь с прежним именем осталась на этом же аппарате:
+    // она попадёт в удаляемые, и это стоит назвать переименованием вслух.
+    const existingName = defaultQueueName(sys.queues, opts.conn);
+    const renaming = existingName !== opts.queueName
+      && sys.queues.some(q => q.name === existingName);
     return (
-      <Frame width={width} subtitle={`перевод на driverless · ${opts.ip}`}>
+      <Frame width={width} subtitle={`перевод на driverless · ${connLabel(opts.conn)}`}>
         <Box flexDirection="column" paddingLeft={3} marginBottom={1}>
+          <Text>
+            <Text color="gray">Связь:   </Text>
+            {opts.conn.kind === 'usb'
+              ? <Text color="cyan">USB · {usbPrinterName(opts.conn.usb)}</Text>
+              : <Text color="green">сеть · {opts.conn.ip}</Text>}
+          </Text>
           <Text><Text color="gray">МФУ:     </Text>{ipp?.model || '—'}</Text>
           {ipp && (
             <Text>
@@ -392,29 +475,55 @@ export function PrinterScreen({ onExit }: Props) {
             <Text color="gray">IPP:     </Text>
             {ipp?.everywhere
               ? <Text color="green">IPP Everywhere поддерживается</Text>
-              : <Text color="red">{blocker || 'нет'}</Text>}
+              : blocker
+                ? <Text color="red">{blocker}</Text>
+                : <Text color="yellow">проверим после запуска ipp-usb</Text>}
             <Text color="gray">   eSCL: </Text>
             <Text color={probe.escl ? 'green' : 'yellow'}>{probe.escl ? 'отвечает' : 'нет'}</Text>
           </Text>
-          <Text><Text color="gray">Очередь: </Text><Text bold>{opts.queueName}</Text></Text>
+          {probe.usbPending !== '' && (
+            <Text><Text color="gray">ipp-usb: </Text><Text color="yellow">{probe.usbPending}</Text></Text>
+          )}
         </Box>
 
         <Box paddingLeft={2}><Text color="cyan" bold>── Параметры ──</Text></Box>
-        {OPT_KEYS.map((kk, i) => {
+        {OPT_ROWS.map((row, i) => {
           const cur = i === optIdx;
-          const off = optDisabled(kk);
-          const on = opts[kk] && !off;
+          if (row === 'name') {
+            return (
+              <Box key="name" paddingLeft={2}>
+                <Text color={cur ? 'white' : 'gray'}>{cur ? '❯ ' : '  '}</Text>
+                <Text color="gray">имя очереди: </Text>
+                <Text bold color={editingName ? 'cyan' : cur ? 'white' : 'gray'}>{opts.queueName}</Text>
+                {editingName && <Text inverse> </Text>}
+              </Box>
+            );
+          }
+          const off = optDisabled(row);
+          const on = opts[row] && !off;
           return (
-            <Box key={kk} paddingLeft={2}>
+            <Box key={row} paddingLeft={2}>
               <Text color={cur ? 'white' : 'gray'}>{cur ? '❯ ' : '  '}</Text>
               <Text color={off ? 'gray' : on ? 'green' : 'gray'}>{on ? '[✓] ' : '[ ] '}</Text>
-              <Text color={off ? 'gray' : cur ? 'white' : 'gray'} dimColor={!!off}>{OPT_TITLES[kk]}</Text>
+              <Text color={off ? 'gray' : cur ? 'white' : 'gray'} dimColor={!!off}>{OPT_TITLES[row]}</Text>
               {off && <Text color="gray" dimColor>  ({off})</Text>}
             </Box>
           );
         })}
+        {nameError !== '' && (
+          <Box paddingLeft={4}><Text color="red">{nameError}</Text></Box>
+        )}
+        {renaming && (
+          <Box paddingLeft={4}>
+            <Text color="yellow">очередь {existingName} будет переименована в {opts.queueName}</Text>
+          </Box>
+        )}
         {opts.removeHplip && !opts.testPage && sys.hplip.length > 0 && (
           <Box paddingLeft={3}><Text color="yellow">  hplip будет удалён без проверки печати</Text></Box>
+        )}
+
+        {hplipKept(sys, opts) !== '' && (
+          <Box paddingLeft={3}><Text color="yellow">  {truncate(hplipKept(sys, opts), width - 8)}</Text></Box>
         )}
 
         <Box paddingLeft={2} marginTop={1}><Text color="cyan" bold>── Будет сделано ──</Text></Box>
@@ -430,7 +539,10 @@ export function PrinterScreen({ onExit }: Props) {
         )}
         <Box paddingLeft={2} marginTop={1}>
           <Text color="gray" dimColor>
-            ↑↓ параметр · Пробел переключить · {blocker ? '' : 'D применить · '}Esc назад
+            {editingName
+              ? 'вводите имя · Ctrl+U очистить · Enter готово'
+              : `↑↓ параметр · Enter/Пробел ${OPT_ROWS[optIdx] === 'name' ? 'править имя' : 'переключить'} · ` +
+                `${blocker || nameError ? '' : 'D применить · '}Esc назад`}
           </Text>
         </Box>
       </Frame>
@@ -453,15 +565,22 @@ export function PrinterScreen({ onExit }: Props) {
             const cur = focus === 'queues' && i === queueIdx;
             const bad = !q.enabled || !q.accepting;
             const warn = !isDriverless(q) || (q.errorPolicy !== '' && q.errorPolicy !== 'retry-job');
+            // Очередь на штатном бэкенде usb: драйверная, но рабочая и от
+            // hplip не зависящая. Красить её как поломку незачем.
+            const plainUsb = q.backend === 'usb' && q.enabled && q.accepting;
             return (
               <Box key={q.name} paddingLeft={2}>
                 <Text color={cur ? 'white' : 'gray'}>{cur ? '❯ ' : '  '}</Text>
-                <Text color={bad ? 'red' : warn ? 'yellow' : 'green'}>
-                  {bad ? '✗ остановлена' : isHplipBackend(q.backend) ? '! hplip      ' : warn ? '! проверить  ' : '✓ driverless '}
+                <Text color={bad ? 'red' : plainUsb ? 'gray' : warn ? 'yellow' : 'green'}>
+                  {bad ? '✗ остановлена'
+                    : isHplipBackend(q.backend) ? '! hplip      '
+                    : plainUsb ? '· usb-драйвер'
+                    : warn ? '! проверить  '
+                    : '✓ driverless '}
                 </Text>
-                <Text color={cur ? 'white' : 'gray'} bold={cur}> {truncate(q.name, 32).padEnd(32)} </Text>
+                <Text color={cur ? 'white' : 'gray'} bold={cur}> {truncate(q.name, 28).padEnd(28)} </Text>
                 <Text color="gray" dimColor>
-                  {q.backend.padEnd(6)} {(q.ip || '—').padEnd(15)}
+                  {q.backend.padEnd(6)} {connColumn(q).padEnd(17)}
                   {q.isDefault ? ' по умолчанию' : ''}
                   {q.jobs > 0 ? ` заданий:${q.jobs}` : ''}
                 </Text>
@@ -488,13 +607,32 @@ export function PrinterScreen({ onExit }: Props) {
                   ...(sys.sharing === 'on' ? ['общий доступ CUPS'] : [])].join(', ') || 'не замаскировано'}
               </Text>}
         </Text>
+        {sys.usb.length > 0 && (
+          <Text>
+            <Text color="gray">принтеры на USB: </Text>
+            <Text color={sys.usb.some(u => u.blocked) ? 'yellow' : 'gray'}>
+              {sys.usb.map(u => `${usbPrinterName(u)}${u.blocked ? ' (заблокирован политикой USB)'
+                : u.ippOverUsb ? '' : ' (без IPP-over-USB)'}`).join(', ')}
+            </Text>
+          </Text>
+        )}
+        {(sys.usb.length > 0 || sys.ippUsb.installed) && (
+          <Text>
+            <Text color="gray">ipp-usb:          </Text>
+            {!sys.ippUsb.installed
+              ? <Text color="yellow">не установлен — driverless по USB пока невозможен</Text>
+              : sys.ippUsb.active
+                ? <Text color="green">работает</Text>
+                : <Text color="yellow">установлен, но не запущен</Text>}
+          </Text>
+        )}
         <Text>
           <Text color="gray">сканер (airscan): </Text>
           {!sys.saneAirscan
             ? <Text color="yellow">sane-airscan не установлен</Text>
-            : sys.airscan.ip
+            : sys.airscan.url
               ? <Text color={sys.airscan.discoveryDisabled ? 'green' : 'yellow'}>
-                  {sys.airscan.ip}{sys.airscan.discoveryDisabled ? ', автопоиск выключен' : ', автопоиск включён'}
+                  {sys.airscan.url}{sys.airscan.discoveryDisabled ? ', автопоиск выключен' : ', автопоиск включён'}
                 </Text>
               : <Text color="yellow">устройство не задано</Text>}
         </Text>
@@ -531,6 +669,7 @@ export function PrinterScreen({ onExit }: Props) {
 const ADVICE: Record<Diagnosis['advice'], string> = {
   migrate: 'Enter — перевести на driverless',
   restore: 'Enter — включить очередь',
+  clear:   'Enter — закрыть очередь и снять задания: аппарат неисправен, копии копятся зря',
   printer: 'проблема на стороне МФУ — проверьте аппарат',
   none:    'проблем не найдено',
 };
@@ -554,10 +693,22 @@ function DiagnosisView({ width, diag }: { width: number; diag: Diagnosis }) {
 
       {p && (
         <Box flexDirection="column" paddingLeft={3} marginBottom={1}>
-          <Text color="cyan">МФУ {p.ip}</Text>
-          <Text>  ping:        {mark(p.ping, 'отвечает', 'не отвечает')}</Text>
-          <Text>  порт 631:    {mark(p.ping ? p.port631 : undefined, 'открыт', 'закрыт')}</Text>
-          <Text>  eSCL (скан): {mark(p.ping ? p.escl : undefined, 'отвечает', 'не отвечает')}</Text>
+          <Text color="cyan">МФУ {connLabel(p.conn)}</Text>
+          {p.conn.kind === 'net' ? (
+            <>
+              <Text>  ping:        {mark(p.reachable, 'отвечает', 'не отвечает')}</Text>
+              <Text>  порт 631:    {mark(p.reachable ? p.ippOpen : undefined, 'открыт', 'закрыт')}</Text>
+            </>
+          ) : (
+            <>
+              <Text>  IPP-over-USB: {mark(p.conn.usb.ippOverUsb, 'аппарат умеет', 'аппарат не умеет')}</Text>
+              <Text>  ipp-usb:      {mark(p.ippUsb.installed && p.ippUsb.active, 'работает', 'не работает')}
+                {p.ippOpen ? <Text color="gray">  порт {p.port}</Text> : null}
+              </Text>
+              {p.usbPending !== '' && <Text color="yellow">  {p.usbPending}</Text>}
+            </>
+          )}
+          <Text>  eSCL (скан): {mark(p.ippOpen || p.reachable ? p.escl : undefined, 'отвечает', 'не отвечает')}</Text>
           {p.ipp ? (
             <>
               <Text>  модель:      {p.ipp.model || '—'}</Text>
@@ -570,7 +721,7 @@ function DiagnosisView({ width, diag }: { width: number; diag: Diagnosis }) {
               ))}
               <Text>  IPP Everywhere: {mark(p.ipp.everywhere, 'да', 'нет')}</Text>
             </>
-          ) : p.ping && p.port631 ? (
+          ) : p.ippOpen ? (
             <Text color="red">  IPP: {p.ippError || 'нет ответа'}</Text>
           ) : null}
         </Box>
@@ -580,6 +731,17 @@ function DiagnosisView({ width, diag }: { width: number; diag: Diagnosis }) {
         <Box flexDirection="column" paddingLeft={3} marginBottom={1}>
           <Text color="cyan">Журнал cups (ошибки бэкенда)</Text>
           {diag.journal.map((l, i) => <Text key={i} color="gray" dimColor>  {truncate(l, width - 8)}</Text>)}
+        </Box>
+      )}
+
+      {diag.jobs.length > 0 && (
+        <Box flexDirection="column" paddingLeft={3} marginBottom={1}>
+          <Text color="cyan">В очереди {diag.jobs.length}</Text>
+          {duplicateJobs(diag.jobs).map(d => (
+            <Text key={d.title} color="yellow">
+              {'  '}«{truncate(d.title, Math.max(10, width - 24))}» — {d.count} раз
+            </Text>
+          ))}
         </Box>
       )}
 
@@ -616,4 +778,10 @@ function Frame({ width, subtitle, children }: {
 
 function truncate(s: string, n: number): string {
   return s.length <= n ? s : s.slice(0, Math.max(1, n - 1)) + '…';
+}
+
+/** Чем очередь подключена — вместо колонки с пустым IP у USB. */
+function connColumn(q: PrintQueue): string {
+  if (q.conn === 'usb') return q.ippPort ? `USB · ipp-usb:${q.ippPort}` : 'USB';
+  return q.ip || '—';
 }

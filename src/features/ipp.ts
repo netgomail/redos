@@ -38,6 +38,7 @@ const TAG = {
 /** Атрибуты, которые нужны для диагностики и решения о переводе. */
 export const PRINTER_ATTRS = [
   'printer-make-and-model',
+  'printer-device-id',
   'printer-state',
   'printer-state-reasons',
   'printer-state-message',
@@ -129,12 +130,19 @@ export function parseIppResponse(buf: Uint8Array): IppResponse {
 
 // ─── запрос к аппарату ────────────────────────────────────────────────────────
 
-export async function getPrinterAttributes(ip: string, timeoutMs = 8000): Promise<IppResponse> {
-  const printerUri = `ipp://${ip}/ipp/print`;
+/**
+ * Аппарат спрашивается по host:port, а не по IP: у сетевого это IP и 631, а у
+ * USB — 127.0.0.1 и порт, который выдал ipp-usb. Дальше по протоколу разницы
+ * между ними нет.
+ */
+export async function getPrinterAttributes(
+  host: string, port = 631, timeoutMs = 8000,
+): Promise<IppResponse> {
+  const printerUri = port === 631 ? `ipp://${host}/ipp/print` : `ipp://${host}:${port}/ipp/print`;
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const resp = await fetch(`http://${ip}:631/ipp/print`, {
+    const resp = await fetch(`http://${host}:${port}/ipp/print`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/ipp' },
       body: encodeGetPrinterAttributes(printerUri),
@@ -151,6 +159,8 @@ export async function getPrinterAttributes(ip: string, timeoutMs = 8000): Promis
 
 export interface PrinterInfo {
   model:        string;
+  /** printer-device-id — строка IEEE 1284 с серийником: по ней узнаётся аппарат. */
+  deviceId:     string;
   state:        'idle' | 'processing' | 'stopped' | 'unknown';
   reasons:      string[];   // без «none»
   message:      string;
@@ -174,6 +184,7 @@ export function summarize(attrs: IppAttributes): PrinterInfo {
   const levels = (attrs.get('marker-levels') ?? []).map(Number);
   return {
     model:      String(first('printer-make-and-model') ?? ''),
+    deviceId:   String(first('printer-device-id') ?? ''),
     state:      STATES[Number(first('printer-state'))] ?? 'unknown',
     reasons:    str('printer-state-reasons').filter(r => r && r !== 'none'),
     message:    String(first('printer-state-message') ?? ''),

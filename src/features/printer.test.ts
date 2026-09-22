@@ -12,9 +12,22 @@ import { encodeGetPrinterAttributes, parseIppResponse, summarize, blockingReason
 import {
   parseQueues, parseAirscanConf, airscanConf, stripLpoptions, errorPolicyFrom,
   planMigration, queuesToRemove, defaultQueueName, analyze, filterCupsJournal,
-  migrationBlocker, discoveryHidden, rollbackScript,
+  migrationBlocker, discoveryHidden, rollbackScript, connOfUri, serialFromUri,
+  isSameDevice, isDriverless, hplipQueuesLeft, hplipKept, connOfQueue,
+  parseLpq, duplicateJobs, plannedUri, esclUrl, queueNameError,
 } from './printer';
-import type { SystemState, MigrateOptions, PrintQueue, PrinterProbe } from './printer';
+import type { SystemState, MigrateOptions, PrintQueue, PrinterProbe, Conn } from './printer';
+import { usbPrintersFrom, matchesDevice, usbBlocker, usbPending } from './usbPrinter';
+import type { UsbPrinter } from './usbPrinter';
+
+/** Аппарат на USB: по умолчанию исправный и с IPP-over-USB. */
+const usbDev = (over: Partial<UsbPrinter> = {}): UsbPrinter => ({
+  port: '2-4', deviceId: '03f0:0f2a', serial: 'CNB1234567',
+  model: 'HP LaserJet MFP M426fdn', vendor: 'HP', ippOverUsb: true, blocked: false,
+  ...over,
+});
+const NET: Conn = { kind: 'net', ip: '10.82.230.207' };
+const USB: Conn = { kind: 'usb', usb: usbDev() };
 
 // ─── IPP ──────────────────────────────────────────────────────────────────────
 
@@ -127,12 +140,16 @@ describe('очереди CUPS', () => {
   });
 
   test('имя очереди по умолчанию — существующая driverless-очередь на этом IP', () => {
-    expect(defaultQueueName(qs, '10.82.230.207')).toBe('HP_LaserJet_MFP_M426fdn');
-    expect(defaultQueueName(qs, '10.82.230.99')).toBe('HP_MFP_99');
+    expect(defaultQueueName(qs, NET)).toBe('HP_LaserJet_MFP_M426fdn');
+    expect(defaultQueueName(qs, { kind: 'net', ip: '10.82.230.99' })).toBe('HP_MFP_99');
   });
 
-  test('удаляются hplip-очереди и очереди на этот IP, чужие — только по выбору', () => {
-    const base = { ip: '10.82.230.207', queueName: 'HP_LaserJet_MFP_M426fdn' };
+  test('имя очереди по умолчанию для USB — из модели аппарата', () => {
+    expect(defaultQueueName([], USB)).toBe('HP_LaserJet_MFP_M426fdn');
+  });
+
+  test('удаляются очереди этого же аппарата, чужие — только по выбору', () => {
+    const base = { conn: NET, queueName: 'HP_LaserJet_MFP_M426fdn' };
     expect(queuesToRemove(qs, { ...base, removeOthers: false }).map(q => q.name))
       .toEqual(['Psiholog_HP_LaserJet_MFP_M426fdn']);
     expect(queuesToRemove(qs, { ...base, removeOthers: true }).map(q => q.name))
@@ -140,8 +157,96 @@ describe('очереди CUPS', () => {
   });
 
   test('hp:-очередь можно перевести под тем же именем — тогда её не удаляют', () => {
-    const r = queuesToRemove(qs, { ip: '10.82.230.207', queueName: 'Psiholog_HP_LaserJet_MFP_M426fdn', removeOthers: false });
+    const r = queuesToRemove(qs, { conn: NET, queueName: 'Psiholog_HP_LaserJet_MFP_M426fdn', removeOthers: false });
     expect(r.map(q => q.name)).toEqual(['HP_LaserJet_MFP_M426fdn']);
+  });
+});
+
+// ─── транспорт очереди ────────────────────────────────────────────────────────
+
+const USB_V = [
+  'device for HP_USB: hp:/usb/HP_LaserJet_MFP_M426fdn?serial=CNB1234567',
+  'device for HP_USB_PLAIN: usb://HP/LaserJet%20MFP%20M426fdn?serial=CNB1234567',
+  'device for HP_IPPUSB: ipp://127.0.0.1:60000/ipp/print',
+  'device for HP_NET: ipp://10.82.230.207/ipp/print',
+];
+const USB_P = USB_V.map(l => `printer ${l.slice(11).split(':')[0]} is idle.  enabled since Mon`);
+
+describe('транспорт очереди', () => {
+  const qs = parseQueues(USB_V, USB_P, [], []);
+  const byName = (n: string) => qs.find(q => q.name === n)!;
+
+  test('USB опознаётся и по hp:/usb/, и по usb:, и по локальному ipp-usb', () => {
+    expect(connOfUri('hp:/usb/HP?serial=X')).toBe('usb');
+    expect(connOfUri('usb://HP/LaserJet')).toBe('usb');
+    expect(connOfUri('ipp://127.0.0.1:60000/ipp/print')).toBe('usb');
+    expect(connOfUri('ipp://10.82.230.207/ipp/print')).toBe('net');
+    expect(connOfUri('dnssd://HP%20LaserJet._ipp._tcp.local/')).toBe('other');
+  });
+
+  test('адрес 127.0.0.1 не выдаётся за сетевой', () => {
+    const q = byName('HP_IPPUSB');
+    expect(q.conn).toBe('usb');
+    expect(q.ip).toBe('');
+    expect(q.ippPort).toBe(60000);
+  });
+
+  test('очередь через ipp-usb — уже driverless, а usb: и hp:/usb/ — ещё нет', () => {
+    expect(isDriverless(byName('HP_IPPUSB'))).toBe(true);
+    expect(isDriverless(byName('HP_NET'))).toBe(true);
+    expect(isDriverless(byName('HP_USB'))).toBe(false);
+    expect(isDriverless(byName('HP_USB_PLAIN'))).toBe(false);
+  });
+
+  test('серийник вытаскивается из URI', () => {
+    expect(serialFromUri('usb://HP/LaserJet%20MFP?serial=CNB1234567')).toBe('CNB1234567');
+    expect(serialFromUri('ipp://10.0.0.5/ipp/print')).toBe('');
+  });
+
+  test('перевод сетевого МФУ не трогает очереди USB-аппарата', () => {
+    // Из-за этого /printer молча сносил рабочий USB-принтер: любая очередь на
+    // hplip считалась мусором, включая hp:/usb/.
+    const r = queuesToRemove(qs, { conn: NET, queueName: 'HP_NET', removeOthers: false });
+    expect(r.map(q => q.name)).toEqual([]);
+  });
+
+  test('перевод USB-аппарата не трогает сетевые очереди', () => {
+    const r = queuesToRemove(qs, { conn: USB, queueName: 'HP_IPPUSB', removeOthers: false });
+    expect(r.map(q => q.name)).toEqual(['HP_USB', 'HP_USB_PLAIN']);
+  });
+
+  test('разные USB-аппараты различаются по серийнику', () => {
+    const other: Conn = { kind: 'usb', usb: usbDev({ serial: 'OTHER999' }) };
+    expect(isSameDevice(byName('HP_USB'), USB)).toBe(true);
+    expect(isSameDevice(byName('HP_USB'), other)).toBe(false);
+  });
+
+  test('аппарат очереди ищется в sysfs по серийнику', () => {
+    const usb = [usbDev({ serial: 'OTHER999' }), usbDev()];
+    const c = connOfQueue(byName('HP_USB'), usb);
+    expect(c?.kind).toBe('usb');
+    expect(c?.kind === 'usb' && c.usb.serial).toBe('CNB1234567');
+    expect(connOfQueue(byName('HP_NET'), usb)).toEqual(NET);
+  });
+});
+
+// ─── hplip держат оставшиеся очереди ──────────────────────────────────────────
+
+describe('удаление hplip', () => {
+  const s = () => state({ queues: parseQueues(USB_V, USB_P, [], []) });
+
+  test('пока USB-очередь на hplip жива, пакет не удаляется', () => {
+    const o = opts({ conn: NET, queueName: 'HP_NET' });
+    expect(hplipQueuesLeft(s(), o).map(q => q.name)).toEqual(['HP_USB']);
+    expect(hplipKept(s(), o)).toContain('HP_USB');
+    expect(ids(s(), o)).not.toContain('hplip');
+  });
+
+  test('когда hplip-очередей не осталось, удаление возвращается в план', () => {
+    const o = opts({ conn: USB, queueName: 'HP_USB' });
+    expect(hplipQueuesLeft(s(), o)).toEqual([]);
+    expect(hplipKept(s(), o)).toBe('');
+    expect(ids(s(), o)).toContain('hplip');
   });
 });
 
@@ -160,16 +265,29 @@ describe('airscan.conf', () => {
       '[options]', '; discovery = enable', 'discovery = disable',
       '[devices]', '"HP LaserJet MFP M426fdn (10.82.230.207)" = http://10.82.230.207/eSCL/, eSCL',
     ].join('\n'));
-    expect(c).toEqual({ ip: '10.82.230.207', discoveryDisabled: true, managed: false });
+    expect(c).toEqual({
+      url: 'http://10.82.230.207/eSCL/', ip: '10.82.230.207',
+      discoveryDisabled: true, managed: false,
+    });
   });
 
   test('сгенерированный конфиг читается обратно', () => {
-    const c = parseAirscanConf(airscanConf('HP "M426" (10.0.0.5)', '10.0.0.5'));
-    expect(c).toEqual({ ip: '10.0.0.5', discoveryDisabled: true, managed: true });
+    const c = parseAirscanConf(airscanConf('HP "M426" (10.0.0.5)', 'http://10.0.0.5/eSCL/'));
+    expect(c).toEqual({
+      url: 'http://10.0.0.5/eSCL/', ip: '10.0.0.5', discoveryDisabled: true, managed: true,
+    });
+  });
+
+  test('сканер по USB — локальный адрес ipp-usb, а не IP', () => {
+    const c = parseAirscanConf(airscanConf('HP M426 (USB)', 'http://127.0.0.1:60000/eSCL/'));
+    expect(c.url).toBe('http://127.0.0.1:60000/eSCL/');
+    expect(c.ip).toBe('');
   });
 
   test('пустой файл', () => {
-    expect(parseAirscanConf('')).toEqual({ ip: '', discoveryDisabled: false, managed: false });
+    expect(parseAirscanConf('')).toEqual({
+      url: '', ip: '', discoveryDisabled: false, managed: false,
+    });
   });
 });
 
@@ -186,15 +304,21 @@ const state = (over: Partial<SystemState> = {}): SystemState => ({
   ],
   sharing: 'off',
   saneAirscan: true,
-  airscan: { ip: '10.82.230.207', discoveryDisabled: true, managed: false },
+  airscan: {
+    url: 'http://10.82.230.207/eSCL/', ip: '10.82.230.207',
+    discoveryDisabled: true, managed: false,
+  },
+  usb: [],
+  ippUsb: { installed: false, active: false },
   ...over,
 });
 const opts = (over: Partial<MigrateOptions> = {}): MigrateOptions => ({
-  ip: '10.82.230.207', queueName: 'HP_LaserJet_MFP_M426fdn',
+  conn: NET, queueName: 'HP_LaserJet_MFP_M426fdn',
   testPage: true, removeHplip: true, hideDiscovery: true, scanner: true, removeOthers: false,
   ...over,
 });
-const ids = (s: SystemState, o: MigrateOptions) => planMigration(s, o).map(p => p.id);
+const ids = (s: SystemState, o: MigrateOptions, pr: PrinterProbe = probe()) =>
+  planMigration(s, o, pr).map(p => p.id);
 
 describe('план перевода', () => {
   test('уже скрытое автообнаружение и настроенный сканер не трогаются', () => {
@@ -202,7 +326,7 @@ describe('план перевода', () => {
   });
 
   test('бэкап всегда первый, hplip — всегда последний', () => {
-    const p = ids(state({ sharing: 'on', saneAirscan: false, airscan: { ip: '', discoveryDisabled: false, managed: false } }), opts());
+    const p = ids(state({ sharing: 'on', saneAirscan: false, airscan: { url: '', ip: '', discoveryDisabled: false, managed: false } }), opts());
     expect(p[0]).toBe('backup');
     expect(p[p.length - 1]).toBe('hplip');
     expect(p).toContain('discovery');
@@ -232,11 +356,21 @@ describe('план перевода', () => {
 // ─── диагностика ──────────────────────────────────────────────────────────────
 
 const probe = (over: Partial<PrinterProbe> = {}): PrinterProbe => ({
-  ip: '10.82.230.207', ping: true, port631: true, escl: true, ippError: '',
+  conn: NET, host: '10.82.230.207', port: 631,
+  reachable: true, ippOpen: true, escl: true, ippError: '',
+  ippUsb: { installed: false, active: false }, usbBlock: '', usbPending: '',
   ipp: {
-    model: 'HP LaserJet MFP M426fdn', state: 'idle', reasons: [], message: '', accepting: true,
+    model: 'HP LaserJet MFP M426fdn', deviceId: 'MFG:HP;MDL:LaserJet MFP M426fdn;SN:CNB1234567;',
+    state: 'idle', reasons: [], message: '', accepting: true,
     formats: ['image/urf'], sides: ['one-sided'], media: [], markers: [], firmware: '', everywhere: true,
   },
+  ...over,
+});
+
+/** Проба USB-аппарата, уже опубликованного ipp-usb. */
+const usbProbe = (over: Partial<PrinterProbe> = {}): PrinterProbe => probe({
+  conn: USB, host: '127.0.0.1', port: 60000,
+  ippUsb: { installed: true, active: true },
   ...over,
 });
 
@@ -277,10 +411,143 @@ describe('диагностика', () => {
 
   test('перевод блокируется, если МФУ не отвечает по IPP или не умеет Everywhere', () => {
     expect(migrationBlocker(probe())).toBe('');
-    expect(migrationBlocker(probe({ ping: false }))).toContain('ping');
-    expect(migrationBlocker(probe({ port631: false }))).toContain('631');
+    expect(migrationBlocker(probe({ reachable: false }))).toContain('ping');
+    expect(migrationBlocker(probe({ ippOpen: false }))).toContain('631');
     expect(migrationBlocker(probe({ ipp: null, ippError: 'HTTP 404' }))).toContain('HTTP 404');
     const p = probe(); p.ipp!.everywhere = false;
     expect(migrationBlocker(p)).toContain('IPP Everywhere');
+  });
+
+  test('сломанный аппарат с копиями в очереди → сначала закрыть очередь', () => {
+    const p = probe();
+    p.ipp!.reasons = ['media-jam-error'];
+    const q: PrintQueue = { ...qs[0], errorPolicy: 'retry-job', jobs: 9 };
+    const jobs = Array.from({ length: 9 }, (_, i) => ({ id: `${i}`, user: 'u', title: 'Отчёт.odt' }));
+    const d = analyze(q, p, [], jobs);
+    expect(d.advice).toBe('clear');
+    expect(d.problems.some(x => x.includes('«Отчёт.odt» ×9'))).toBe(true);
+  });
+
+  test('у USB-очереди не выдумывается отсутствующий IP и SNMP', () => {
+    const usbQ = parseQueues(USB_V, USB_P, [], []).find(q => q.name === 'HP_USB')!;
+    const d = analyze(usbQ, null, [], []);
+    expect(d.problems.some(x => x.includes('нет ни адреса'))).toBe(false);
+    expect(d.problems.some(x => x.includes('SNMP'))).toBe(false);
+    expect(d.problems.some(x => x.includes('hplip'))).toBe(true);
+  });
+});
+
+// ─── USB: аппарат, ipp-usb, план ──────────────────────────────────────────────
+
+describe('USB-принтер', () => {
+  const sysfs = (over: Record<string, unknown> = {}) => ([{
+    port: '2-4', deviceId: '03f0:0f2a', serial: 'CNB1234567',
+    manufacturer: 'HP', product: 'HP LaserJet MFP M426fdn', authorized: true,
+    interfaces: ['07:01:02', '07:01:04', 'ff:cc:00'], declared: [], storage: [],
+    ...over,
+  }] as unknown as Parameters<typeof usbPrintersFrom>[0]);
+
+  test('принтер опознаётся по классу интерфейса, IPP-over-USB — по протоколу 04', () => {
+    const [p] = usbPrintersFrom(sysfs());
+    expect(p.model).toBe('HP LaserJet MFP M426fdn');
+    expect(p.ippOverUsb).toBe(true);
+    expect(usbBlocker(p)).toBe('');
+  });
+
+  test('без интерфейса 07:*:04 driverless по USB невозможен', () => {
+    const [p] = usbPrintersFrom(sysfs({ interfaces: ['07:01:02', 'ff:cc:00'] }));
+    expect(p.ippOverUsb).toBe(false);
+    expect(usbBlocker(p)).toContain('IPP-over-USB');
+  });
+
+  test('заблокированный политикой USB аппарат называет причину', () => {
+    const [p] = usbPrintersFrom(sysfs({ authorized: false, interfaces: [], declared: ['07:01:04'] }));
+    expect(p.blocked).toBe(true);
+    expect(usbBlocker(p)).toContain('/usb-policy');
+  });
+
+  test('отсутствие ipp-usb — не препятствие, а шаг плана', () => {
+    const p = usbDev();
+    expect(usbBlocker(p)).toBe('');
+    expect(usbPending({ installed: false, active: false }, 0)).toContain('установлен');
+    expect(usbPending({ installed: true, active: false }, 0)).toContain('не запущена');
+    expect(usbPending({ installed: true, active: true }, 0)).toContain('usblp');
+    expect(usbPending({ installed: true, active: true }, 60000)).toBe('');
+  });
+
+  test('аппарат на порту ipp-usb узнаётся по серийнику из printer-device-id', () => {
+    const info = { model: 'HP LaserJet MFP M426fdn', deviceId: 'MFG:HP;MDL:M426fdn;SN:CNB1234567;' };
+    expect(matchesDevice(info as never, usbDev())).toBe(true);
+    expect(matchesDevice(info as never, usbDev({ serial: 'OTHER999' }))).toBe(false);
+  });
+
+  test('перевод по USB не блокируется, пока ipp-usb не поднят', () => {
+    const p = usbProbe({ ippOpen: false, ipp: null, usbPending: 'ipp-usb не установлен' });
+    expect(migrationBlocker(p)).toBe('');
+    expect(plannedUri(p)).toContain('<порт ipp-usb>');
+  });
+
+  test('в план USB попадает подъём ipp-usb, а очередь и сканер — на локальный порт', () => {
+    const s = state({ usb: [usbDev()], ippUsb: { installed: false, active: false }, hplip: [] });
+    const o = opts({ conn: USB, queueName: 'HP_USB' });
+    const plan = planMigration(s, o, usbProbe());
+    expect(plan.map(x => x.id)).toContain('ipp-usb');
+    expect(plan.find(x => x.id === 'ipp-usb')!.detail.join(' ')).toContain('dnf install -y ipp-usb');
+    expect(plan.find(x => x.id === 'queue')!.title).toContain('ipp://127.0.0.1:60000/ipp/print');
+    expect(plan.find(x => x.id === 'airscan')!.detail.join(' ')).toContain('http://127.0.0.1:60000/eSCL/');
+  });
+
+  test('при уже работающем ipp-usb лишнего шага нет', () => {
+    const s = state({ usb: [usbDev()], ippUsb: { installed: true, active: true } });
+    expect(ids(s, opts({ conn: USB, queueName: 'HP_USB' }), usbProbe())).not.toContain('ipp-usb');
+  });
+
+  test('адрес сканера: сеть — 80 порт, USB — порт ipp-usb', () => {
+    expect(esclUrl(probe())).toBe('http://10.82.230.207/eSCL/');
+    expect(esclUrl(usbProbe())).toBe('http://127.0.0.1:60000/eSCL/');
+  });
+});
+
+// ─── имя очереди ──────────────────────────────────────────────────────────────
+
+describe('имя очереди', () => {
+  test('пропускаются имена, которые примет CUPS', () => {
+    expect(queueNameError('HP_LaserJet_MFP_M426fdn')).toBe('');
+    expect(queueNameError('Бухгалтерия-МФУ')).toBe('');
+  });
+
+  test('запрещённое CUPS отсекается до начала перевода', () => {
+    expect(queueNameError('')).toContain('пустым');
+    expect(queueNameError('HP LaserJet')).toContain('пробел');
+    expect(queueNameError('HP/2')).toContain('/');
+    expect(queueNameError('HP#2')).toContain('#');
+    expect(queueNameError('x'.repeat(128))).toContain('127');
+  });
+});
+
+// ─── задания в очереди ────────────────────────────────────────────────────────
+
+describe('задания', () => {
+  const out = [
+    'HP_LaserJet is not ready',
+    'Rank    Owner   Job     File(s)                         Total Size',
+    'active  psiholog 243    Отчёт за сентябрь.odt           951296 bytes',
+    '1st     psiholog 244    Отчёт за сентябрь.odt           951296 bytes',
+    '2nd     psiholog 245    Отчёт за сентябрь.odt           951296 bytes',
+    '3rd     buh      246    Акт.pdf                         12288 bytes',
+  ];
+
+  test('lpq разбирается вместе с именами документов', () => {
+    const jobs = parseLpq(out);
+    expect(jobs).toHaveLength(4);
+    expect(jobs[0]).toEqual({ id: '243', user: 'psiholog', title: 'Отчёт за сентябрь.odt' });
+  });
+
+  test('повторы одного документа считаются — это и есть сломанный принтер', () => {
+    expect(duplicateJobs(parseLpq(out))).toEqual([{ title: 'Отчёт за сентябрь.odt', count: 3 }]);
+  });
+
+  test('шапка без заданий даёт пустой список', () => {
+    expect(parseLpq(['HP is ready', 'no entries'])).toEqual([]);
   });
 });
