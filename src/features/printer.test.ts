@@ -15,6 +15,7 @@ import {
   migrationBlocker, discoveryHidden, rollbackScript, connOfUri, serialFromUri,
   isSameDevice, isDriverless, hplipQueuesLeft, hplipKept, connOfQueue,
   parseLpq, duplicateJobs, plannedUri, esclUrl, queueNameError,
+  notAccepting, suggestRemoveHplip, scannerPossible,
 } from './printer';
 import type { SystemState, MigrateOptions, PrintQueue, PrinterProbe, Conn } from './printer';
 import { usbPrintersFrom, matchesDevice, usbBlocker, usbPending } from './usbPrinter';
@@ -141,7 +142,12 @@ describe('очереди CUPS', () => {
 
   test('имя очереди по умолчанию — существующая driverless-очередь на этом IP', () => {
     expect(defaultQueueName(qs, NET)).toBe('HP_LaserJet_MFP_M426fdn');
-    expect(defaultQueueName(qs, { kind: 'net', ip: '10.82.230.99' })).toBe('HP_MFP_99');
+    expect(defaultQueueName(qs, { kind: 'net', ip: '10.82.230.99' })).toBe('Printer_99');
+  });
+
+  test('имя новой очереди — по модели, которую назвал аппарат, у любого производителя', () => {
+    expect(defaultQueueName(qs, { kind: 'net', ip: '10.82.230.99' }, 'Kyocera ECOSYS M2040dn'))
+      .toBe('Kyocera_ECOSYS_M2040dn_99');
   });
 
   test('имя очереди по умолчанию для USB — из модели аппарата', () => {
@@ -357,7 +363,7 @@ describe('план перевода', () => {
 
 const probe = (over: Partial<PrinterProbe> = {}): PrinterProbe => ({
   conn: NET, host: '10.82.230.207', port: 631,
-  reachable: true, ippOpen: true, escl: true, ippError: '',
+  reachable: true, ping: true, ippOpen: true, escl: true, ippError: '',
   ippUsb: { installed: false, active: false }, usbBlock: '', usbPending: '',
   ipp: {
     model: 'HP LaserJet MFP M426fdn', deviceId: 'MFG:HP;MDL:LaserJet MFP M426fdn;SN:CNB1234567;',
@@ -407,6 +413,26 @@ describe('диагностика', () => {
     const p = probe();
     p.ipp!.reasons = ['media-jam-error'];
     expect(analyze({ ...qs[0], errorPolicy: 'retry-job' }, p, []).advice).toBe('printer');
+  });
+
+  test('закрытый ICMP не мешает: аппарат на связи, раз отвечает по IPP', () => {
+    expect(migrationBlocker(probe({ ping: false }))).toBe('');
+  });
+
+  test('после перевода старые сбои hplip в журнале не приписываются IPP-очереди', () => {
+    const q: PrintQueue = { ...qs[0], errorPolicy: 'retry-job' };
+    expect(filterCupsJournal([
+      'hp[3334]: io/hpmud/jd.c 94: unable to read device-id',
+      'cupsd[792]: [Job 243] Backend hp returned status 1 (failed)',
+      'cupsd[792]: [Job 250] The printer is not responding.',
+    ], q)).toEqual(['cupsd[792]: [Job 250] The printer is not responding.']);
+    expect(analyze(q, probe(), journal).problems.some(p => p.includes('hplip'))).toBe(false);
+  });
+
+  test('retry-job молча повторяет задание — сообщение бэкенда показывается', () => {
+    const q: PrintQueue = { ...qs[0], errorPolicy: 'retry-job', reason: 'Printer not connected; will retry in 30 seconds.' };
+    expect(analyze(q, probe(), []).problems).toContain('CUPS сообщает: Printer not connected; will retry in 30 seconds.');
+    expect(analyze({ ...q, reason: 'Ready to print.' }, probe(), []).advice).toBe('none');
   });
 
   test('перевод блокируется, если МФУ не отвечает по IPP или не умеет Everywhere', () => {
@@ -549,5 +575,44 @@ describe('задания', () => {
 
   test('шапка без заданий даёт пустой список', () => {
     expect(parseLpq(['HP is ready', 'no entries'])).toEqual([]);
+  });
+});
+
+// ─── доработки удобства ───────────────────────────────────────────────────────
+
+describe('удобство', () => {
+  test('имя очереди: всё, что отвергнет lpadmin, отсекается заранее', () => {
+    for (const bad of ['a\\b', 'a?b', "a'b", 'a"b', 'a@host', 'a\x7fb'])
+      expect(queueNameError(bad)).not.toBe('');
+    expect(queueNameError('Принтер_бухгалтерии')).toBe('');
+  });
+
+  test('lpstat -a разбирается один раз на все очереди', () => {
+    expect([...notAccepting([
+      'HP accepting requests since Mon 21 Sep 2026',
+      'Kyocera not accepting requests since Mon 21 Sep 2026 -',
+      '\tпринтер в ремонте (redos)',
+    ])]).toEqual(['Kyocera']);
+  });
+
+  test('hplip по умолчанию удаляется только при переводе HP', () => {
+    const s = state({ queues: [] });
+    expect(suggestRemoveHplip(s, NET, 'HP LaserJet MFP M426fdn')).toBe(true);
+    expect(suggestRemoveHplip(s, NET, 'Kyocera ECOSYS M2040dn')).toBe(false);
+    expect(suggestRemoveHplip(state({ hplip: [] }), NET, 'HP LaserJet')).toBe(false);
+    // очередь этого аппарата на hplip — удалять, кто бы ни был производитель
+    expect(suggestRemoveHplip(state(), NET, '')).toBe(true);
+  });
+
+  test('сканер: USB до ipp-usb — можно, сеть без eSCL — нет, и в план не попадает', () => {
+    expect(scannerPossible(usbProbe({ ippOpen: false, escl: false }))).toBe(true);
+    expect(scannerPossible(probe({ escl: false }))).toBe(false);
+    const s = state({ airscan: { url: '', ip: '', discoveryDisabled: false, managed: false } });
+    expect(ids(s, opts(), probe({ escl: false }))).not.toContain('airscan');
+  });
+
+  test('аппарат без модели не совпадает с любым USB-принтером', () => {
+    const info = { ...probe().ipp!, model: '', deviceId: '' };
+    expect(matchesDevice(info, usbDev({ serial: '' }))).toBe(false);
   });
 });

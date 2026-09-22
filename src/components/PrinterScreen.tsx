@@ -5,7 +5,8 @@ import {
   readSystemState, diagnose, restoreQueue, clearQueue, closeQueue,
   findCandidates, probePrinter, planMigration, migrate, migrationBlocker,
   defaultQueueName, discoveryHidden, isHplipBackend, isDriverless, isIpv4,
-  connLabel, connKey, hplipKept, duplicateJobs, queueNameError,
+  connLabel, connKey, connOfQueue, hplipKept, duplicateJobs, queueNameError,
+  scannerPossible, suggestRemoveHplip,
 } from '../features/printer';
 import { usbPrinterName } from '../features/usbPrinter';
 import type {
@@ -23,6 +24,7 @@ type Phase =
   | 'diagnosis'  // отчёт диагностики
   | 'pick'       // выбор МФУ для перевода
   | 'probing'    // опрос выбранного МФУ
+  | 'name'       // имя принтера: подставлено по умолчанию, Enter — оставить
   | 'options'    // что будет сделано + переключатели, D — применить
   | 'running'    // живой лог шагов
   | 'result';
@@ -76,9 +78,20 @@ type OptRow = typeof OPT_ROWS[number];
 
 interface ResultView { ok: boolean; title: string; lines: string[] }
 
+/**
+ * Буква команды в русской раскладке: администратор часто набирает с ней, и
+ * «D применить» молча не срабатывало бы, пока не переключишь язык.
+ */
+const RU_KEY: Record<string, string> = { d: 'в', q: 'й' };
+
 export function PrinterScreen({ onExit }: Props) {
   const { stdout } = useStdout();
   const width = stdout?.columns ?? 80;
+  // Экран выше окна терминала Ink перерисовывает с мусором и дублями строк,
+  // поэтому длинные списки режутся по высоте, а результат прокручивается.
+  const rows = stdout?.rows ?? 40;
+  // рамка (3), заголовок результата (2), подсказка (2) и запас на перенос
+  const resultRows = Math.max(5, rows - 9);
 
   const [phase, setPhase] = useState<Phase>('loading');
   const [sys, setSys] = useState<SystemState | null>(null);
@@ -97,6 +110,7 @@ export function PrinterScreen({ onExit }: Props) {
   const [manualIp, setManualIp] = useState('');
   const [ipError, setIpError] = useState('');
   const [pickFocus, setPickFocus] = useState<'list' | 'input'>('list');
+  const [pickError, setPickError] = useState('');
 
   // параметры перевода
   const [probe, setProbe] = useState<PrinterProbe | null>(null);
@@ -110,6 +124,7 @@ export function PrinterScreen({ onExit }: Props) {
   const [log, setLog] = useState<string[]>([]);
   const [runTitle, setRunTitle] = useState('');
   const [result, setResult] = useState<ResultView | null>(null);
+  const [resultTop, setResultTop] = useState(0);
 
   // Ink рисует во время await, но обновлять state после ухода с экрана нельзя.
   const alive = useRef(true);
@@ -131,6 +146,7 @@ export function PrinterScreen({ onExit }: Props) {
   // ── действия ────────────────────────────────────────────────────────────────
 
   const startRun = (title: string) => { setRunTitle(title); setLog([]); setPhase('running'); };
+  const showResult = (r: ResultView) => { setResult(r); setResultTop(0); setPhase('result'); };
   const step = (msg: string) => { if (alive.current) setLog(l => [...l, msg]); };
 
   const doDiagnose = async (q: PrintQueue) => {
@@ -148,24 +164,21 @@ export function PrinterScreen({ onExit }: Props) {
     startRun(`Восстановление очереди: ${q.name}`);
     const r = await restoreQueue(q, step);
     if (!alive.current) return;
-    setResult({ ok: r.ok, title: `Очередь ${q.name}`, lines: r.msg.split('; ') });
-    setPhase('result');
+    showResult({ ok: r.ok, title: `Очередь ${q.name}`, lines: r.msg.split('; ') });
   };
 
   const doClear = async (q: PrintQueue) => {
     startRun(`Очистка очереди: ${q.name}`);
     const r = await clearQueue(q, step);
     if (!alive.current) return;
-    setResult({ ok: r.ok, title: `Очередь ${q.name}`, lines: r.msg.split('; ') });
-    setPhase('result');
+    showResult({ ok: r.ok, title: `Очередь ${q.name}`, lines: r.msg.split('; ') });
   };
 
   const doClose = async (q: PrintQueue) => {
     startRun(`Закрытие очереди: ${q.name}`);
     const r = await closeQueue(q, step);
     if (!alive.current) return;
-    setResult({ ok: r.ok, title: `Очередь ${q.name}`, lines: r.msg.split('; ') });
-    setPhase('result');
+    showResult({ ok: r.ok, title: `Очередь ${q.name}`, lines: r.msg.split('; ') });
   };
 
   const openPick = () => {
@@ -174,6 +187,7 @@ export function PrinterScreen({ onExit }: Props) {
     setCandIdx(0);
     setManualIp(selectedQueue?.ip || sys.airscan.ip || '');
     setIpError('');
+    setPickError('');
     setPickFocus('list');
     setPhase('pick');
     (async () => {
@@ -181,9 +195,9 @@ export function PrinterScreen({ onExit }: Props) {
       const list = await findCandidates(sys);
       if (!alive.current) return;
       setCands(list);
-      // сначала аппарат выбранной очереди
-      const mine = selectedQueue?.ip ? `net:${selectedQueue.ip}` : '';
-      const i = mine ? list.findIndex(c => connKey(c.conn) === mine) : -1;
+      // сначала аппарат выбранной очереди — сетевой или USB
+      const own = selectedQueue ? connOfQueue(selectedQueue, sys.usb) : null;
+      const i = own ? list.findIndex(c => connKey(c.conn) === connKey(own)) : -1;
       setCandIdx(i >= 0 ? i : 0);
       setSearching(false);
     })();
@@ -197,20 +211,25 @@ export function PrinterScreen({ onExit }: Props) {
     const p = await probePrinter(conn);
     if (!alive.current) return;
     setProbe(p);
+    const model = p.ipp?.model ?? '';
     setOpts({
       conn,
-      queueName:     defaultQueueName(sys.queues, conn),
+      queueName:     defaultQueueName(sys.queues, conn, model),
       testPage:      true,
-      removeHplip:   sys.hplip.length > 0,
+      removeHplip:   suggestRemoveHplip(sys, conn, model),
       hideDiscovery: true,
       // У USB сканер проверяется только после запуска ipp-usb: до него eSCL
       // спрашивать негде. Предлагаем настроить — аппарат почти всегда МФУ.
-      scanner:       p.escl || (conn.kind === 'usb' && !p.ippOpen),
+      scanner:       scannerPossible(p),
       removeOthers:  false,
     });
     setOptIdx(0);
     setEditingName(false);
-    setPhase('options');
+    setNamePos(Number.MAX_SAFE_INTEGER);
+    // Имя спрашивается отдельным шагом: строку в списке параметров не
+    // замечали и переводили под именем по умолчанию. Если перевод невозможен,
+    // спрашивать имя незачем — сразу экран с причиной.
+    setPhase(migrationBlocker(p) ? 'options' : 'name');
   };
 
   const doMigrate = async () => {
@@ -223,8 +242,7 @@ export function PrinterScreen({ onExit }: Props) {
     if (r.scanners.length) lines.push('', 'Сканеры:', ...r.scanners.map(l => '  ' + l));
     if (r.backupDir)       lines.push('', `Откат: ${r.backupDir}/rollback.sh`);
     if (r.ok)              lines.push('Дальше: перезагрузка → печать из LibreOffice и браузера под обычным пользователем.');
-    setResult({ ok: r.ok, title: `Перевод на driverless: ${connLabel(opts.conn)}`, lines });
-    setPhase('result');
+    showResult({ ok: r.ok, title: `Перевод на driverless: ${connLabel(opts.conn)}`, lines });
   };
 
   const runAction = (a: Action) => {
@@ -243,10 +261,13 @@ export function PrinterScreen({ onExit }: Props) {
     if (!sys || !probe) return '';
     if (k === 'removeHplip' && sys.hplip.length === 0) return 'не установлен';
     if (k === 'hideDiscovery' && discoveryHidden(sys) && sys.sharing === 'off') return 'уже отключено';
-    if (k === 'scanner' && !probe.escl)
-      return probe.conn.kind === 'usb' && !probe.ippOpen ? 'проверим после запуска ipp-usb' : 'МФУ не отвечает по eSCL';
+    if (k === 'scanner' && !scannerPossible(probe)) return 'МФУ не отвечает по eSCL';
     return '';
   };
+
+  /** Оговорка к включаемому параметру — в отличие от optDisabled, не запрещает. */
+  const optNote = (k: OptKey): string =>
+    k === 'scanner' && probe && !probe.escl && scannerPossible(probe) ? 'eSCL проверим после запуска ipp-usb' : '';
 
   // ── ввод ────────────────────────────────────────────────────────────────────
 
@@ -254,10 +275,16 @@ export function PrinterScreen({ onExit }: Props) {
     if (phase === 'loading' || phase === 'running' || phase === 'probing') return;
 
     // Ink отдаёт Ctrl+D как char='d' с ctrl — без проверки Ctrl+D применил бы перевод.
-    const k = (c: string) => !key.ctrl && !key.meta && char.toLowerCase() === c;
+    const k = (c: string) => !key.ctrl && !key.meta
+      && (char.toLowerCase() === c || char.toLowerCase() === RU_KEY[c]);
 
     if (phase === 'result') {
-      if (k('q') || key.escape || key.return) refresh();
+      if (k('q') || key.escape || key.return) { refresh(); return; }
+      const max = Math.max(0, resultLines(result?.lines ?? [], width - 6).length - resultRows);
+      if (key.upArrow)   setResultTop(t => Math.max(0, t - 1));
+      if (key.downArrow) setResultTop(t => Math.min(max, t + 1));
+      if (key.pageUp)    setResultTop(t => Math.max(0, t - resultRows));
+      if (key.pageDown)  setResultTop(t => Math.min(max, t + resultRows));
       return;
     }
 
@@ -268,7 +295,44 @@ export function PrinterScreen({ onExit }: Props) {
         else if (diag.advice === 'clear') doClose(diag.queue);
         // У USB-очереди своего IP нет — аппарат для неё уже опознан пробой.
         else if (diag.advice === 'migrate' && diag.probe) openOptions(diag.probe.conn, 'diagnosis');
+        // Аппарат по URI не опознан (dnssd://, имя хоста) — пусть выберут сами.
+        else if (diag.advice === 'migrate') openPick();
       }
+      return;
+    }
+
+    /** Правка имени: курсор ←→, вставка в любом месте, Backspace, Ctrl+U. */
+    const editName = () => {
+      if (!opts) return;
+      const name = opts.queueName;
+      const pos = Math.min(namePos, name.length);
+      const setName = (next: string, at: number) => {
+        setOpts({ ...opts, queueName: next });
+        setNamePos(Math.max(0, Math.min(at, next.length)));
+      };
+      if (key.leftArrow)  { setNamePos(Math.max(0, pos - 1)); return; }
+      if (key.rightArrow) { setNamePos(Math.min(name.length, pos + 1)); return; }
+      if (key.home || (key.ctrl && char === 'a')) { setNamePos(0); return; }
+      if (key.end  || (key.ctrl && char === 'e')) { setNamePos(name.length); return; }
+      if (key.ctrl && char === 'u') { setName('', 0); return; }
+      // Backspace приходит и как backspace, и как delete — зависит от
+      // терминала. Оба стирают символ слева: так же ведёт себя поле IP рядом.
+      if (key.backspace || key.delete) {
+        if (pos > 0) setName(name.slice(0, pos - 1) + name.slice(pos), pos - 1);
+        return;
+      }
+      if (char && !key.ctrl && !key.meta && char.charCodeAt(0) >= 0x20) {
+        setName(name.slice(0, pos) + char + name.slice(pos), pos + char.length);
+      }
+    };
+
+    if (phase === 'name') {
+      if (key.escape) { setPhase(optionsBack); return; }
+      if (key.return) {
+        if (opts && !queueNameError(opts.queueName)) { setOptIdx(1); setPhase('options'); }
+        return;
+      }
+      editName();
       return;
     }
 
@@ -276,26 +340,8 @@ export function PrinterScreen({ onExit }: Props) {
       // Правка имени перехватывает весь ввод: иначе «d» из имени запустило бы
       // перевод, а пробел переключил бы параметр.
       if (editingName && opts) {
-        const name = opts.queueName;
-        const pos = Math.min(namePos, name.length);
-        const setName = (next: string, at: number) => {
-          setOpts({ ...opts, queueName: next });
-          setNamePos(Math.max(0, Math.min(at, next.length)));
-        };
-
         if (key.return || key.escape) { setEditingName(false); return; }
-        if (key.leftArrow)  { setNamePos(Math.max(0, pos - 1)); return; }
-        if (key.rightArrow) { setNamePos(Math.min(name.length, pos + 1)); return; }
-        if (key.ctrl && char === 'u') { setName('', 0); return; }
-        // Backspace приходит и как backspace, и как delete — зависит от
-        // терминала. Оба стирают символ слева: так же ведёт себя поле IP рядом.
-        if (key.backspace || key.delete) {
-          if (pos > 0) setName(name.slice(0, pos - 1) + name.slice(pos), pos - 1);
-          return;
-        }
-        if (char && !key.ctrl && !key.meta && char.charCodeAt(0) >= 0x20) {
-          setName(name.slice(0, pos) + char + name.slice(pos), pos + char.length);
-        }
+        editName();
         return;
       }
 
@@ -314,7 +360,7 @@ export function PrinterScreen({ onExit }: Props) {
 
     if (phase === 'pick') {
       if (key.escape) { setPhase('view'); return; }
-      if (key.tab) { setPickFocus(f => f === 'list' ? 'input' : 'list'); return; }
+      if (key.tab) { setPickFocus(f => f === 'list' ? 'input' : 'list'); setPickError(''); return; }
 
       if (pickFocus === 'input') {
         if (key.return) {
@@ -326,13 +372,20 @@ export function PrinterScreen({ onExit }: Props) {
         }
         if (key.ctrl && char === 'u') { setManualIp(''); setIpError(''); return; }
         if (key.backspace || key.delete) { setManualIp(s => s.slice(0, -1)); setIpError(''); return; }
-        if (char && !key.ctrl && !key.meta && /^[0-9.]$/.test(char)) { setManualIp(s => s + char); setIpError(''); }
+        // Точка в русской раскладке — «ю» или «,» на цифровом блоке.
+        const c = /^[,юЮ]$/.test(char) ? '.' : char;
+        if (c && !key.ctrl && !key.meta && /^[0-9.]$/.test(c)) { setManualIp(s => s + c); setIpError(''); }
         return;
       }
 
-      if (key.upArrow)   setCandIdx(i => Math.max(0, i - 1));
-      if (key.downArrow) setCandIdx(i => Math.min(Math.max(0, cands.length - 1), i + 1));
-      if (key.return && cands[candIdx] && !cands[candIdx].note) openOptions(cands[candIdx].conn);
+      if (key.upArrow)   { setCandIdx(i => Math.max(0, i - 1)); setPickError(''); }
+      if (key.downArrow) { setCandIdx(i => Math.min(Math.max(0, cands.length - 1), i + 1)); setPickError(''); }
+      if (key.return && cands[candIdx]) {
+        const c = cands[candIdx];
+        // Раньше Enter на таком аппарате молча ничего не делал.
+        if (c.note) setPickError(`нельзя выбрать: ${c.note}`);
+        else openOptions(c.conn);
+      }
       return;
     }
 
@@ -346,6 +399,8 @@ export function PrinterScreen({ onExit }: Props) {
     if (focus === 'queues') {
       if (key.upArrow)   { if (queueIdx === 0) setFocus('actions'); else setQueueIdx(i => i - 1); }
       if (key.downArrow) { if (queueIdx >= queues.length - 1) setFocus('actions'); else setQueueIdx(i => i + 1); }
+      // Самое частое, что делают с выбранной очередью, — выясняют, что с ней.
+      if (key.return && selectedQueue) doDiagnose(selectedQueue);
       return;
     }
 
@@ -373,10 +428,10 @@ export function PrinterScreen({ onExit }: Props) {
         {phase === 'probing' && (
           <Box paddingLeft={3}><Text color="gray">ping, порт 631, IPP Get-Printer-Attributes, eSCL...</Text></Box>
         )}
-        {log.map((l, i) => (
+        {log.slice(-Math.max(3, rows - 9)).map((l, i, shown) => (
           <Box key={i} paddingLeft={3}>
-            <Text color={i === log.length - 1 ? 'white' : 'gray'}>
-              {i === log.length - 1 ? '❯ ' : '  '}{truncate(l, width - 8)}
+            <Text color={i === shown.length - 1 ? 'white' : 'gray'}>
+              {i === shown.length - 1 ? '❯ ' : '  '}{truncate(l, width - 8)}
             </Text>
           </Box>
         ))}
@@ -386,25 +441,29 @@ export function PrinterScreen({ onExit }: Props) {
   }
 
   if (phase === 'result' && result) {
+    const shown = resultLines(result.lines, width - 6);
+    const top = Math.min(resultTop, Math.max(0, shown.length - resultRows));
+    const scroll = shown.length > resultRows;
     return (
       <Frame width={width} subtitle="результат">
         <Box paddingLeft={3} marginBottom={1}>
           <Text bold color={result.ok ? 'green' : 'red'}>{result.ok ? '✓ ' : '✗ '}{result.title}</Text>
         </Box>
-        {result.lines.map((l, i) => (
-          <Box key={i} paddingLeft={3}>
-            <Text color={l.startsWith('✓') ? 'green' : l.startsWith('✗') ? 'red' : l.startsWith('•') ? 'yellow' : 'gray'}>
-              {l || ' '}
-            </Text>
-          </Box>
+        {shown.slice(top, top + resultRows).map((l, i) => (
+          <Box key={top + i} paddingLeft={3}><Text color={l.color}>{l.text || ' '}</Text></Box>
         ))}
-        <Box paddingLeft={2} marginTop={1}><Text color="gray" dimColor>Q/Esc/Enter — назад</Text></Box>
+        <Box paddingLeft={2} marginTop={1}>
+          <Text color="gray" dimColor>
+            {scroll ? `строки ${top + 1}–${Math.min(top + resultRows, shown.length)} из ${shown.length} · ↑↓ PgUp PgDn прокрутка · ` : ''}
+            Q/Esc/Enter — назад
+          </Text>
+        </Box>
       </Frame>
     );
   }
 
   if (phase === 'diagnosis' && diag) {
-    return <DiagnosisView width={width} diag={diag} />;
+    return <DiagnosisView width={width} rows={rows} diag={diag} />;
   }
 
   if (phase === 'pick') {
@@ -418,7 +477,7 @@ export function PrinterScreen({ onExit }: Props) {
             <Box key={connKey(c.conn)} flexDirection="column">
               <Box paddingLeft={2}>
                 <Text color={cur ? 'white' : 'gray'}>{cur ? '❯ ' : '  '}</Text>
-                <Text color={c.note ? 'gray' : usb ? 'cyan' : 'green'}>{usb ? 'USB ' : 'сеть '}</Text>
+                <Text color={c.note ? 'gray' : usb ? 'cyan' : 'green'}>{usb ? 'USB  ' : 'сеть '}</Text>
                 <Text color={cur && !c.note ? 'white' : 'gray'} bold={cur} dimColor={!!c.note}>
                   {truncate(c.label, 34).padEnd(34)}
                 </Text>
@@ -444,12 +503,59 @@ export function PrinterScreen({ onExit }: Props) {
           {pickFocus === 'input' && <Text inverse> </Text>}
         </Box>
         {ipError !== '' && <Box paddingLeft={3}><Text color="red">  {ipError}</Text></Box>}
+        {pickError !== '' && pickFocus === 'list' && (
+          <Box paddingLeft={3}><Text color="red">  {truncate(pickError, width - 8)}</Text></Box>
+        )}
 
         <Box paddingLeft={2} marginTop={1}>
           <Text color="gray" dimColor>
             {pickFocus === 'list'
-              ? '↑↓ выбор · Enter проверить аппарат · Tab ввод IP · Esc назад'
+              ? '↑↓ выбор · Enter проверить аппарат · Tab ввести IP вручную · Esc назад'
               : 'цифры и точка · Ctrl+U очистить · Enter проверить МФУ · Tab к списку · Esc назад'}
+          </Text>
+        </Box>
+      </Frame>
+    );
+  }
+
+  if (phase === 'name' && opts && probe) {
+    const nameError = queueNameError(opts.queueName);
+    const existingName = defaultQueueName(sys.queues, opts.conn, probe.ipp?.model ?? '');
+    const existing = sys.queues.find(q => q.name === existingName);
+    const clash = sys.queues.find(q => q.name === opts.queueName);
+    return (
+      <Frame width={width} subtitle={`имя принтера · ${connLabel(opts.conn)}`}>
+        <Box flexDirection="column" paddingLeft={3} marginBottom={1}>
+          <Text><Text color="gray">Аппарат: </Text>{probe.ipp?.model || connLabel(opts.conn)}</Text>
+          <Text><Text color="gray">Связь:   </Text>{opts.conn.kind === 'usb' ? 'USB' : `сеть · ${opts.conn.ip}`}</Text>
+        </Box>
+        <Box paddingLeft={3}>
+          <Text color="gray">Под этим именем принтер увидят пользователи в окне печати.</Text>
+        </Box>
+        <Box paddingLeft={3} marginBottom={1}>
+          <Text color="gray">Оставьте предложенное или введите своё.</Text>
+        </Box>
+        <Box paddingLeft={3}>
+          <Text bold>Имя принтера: </Text>
+          <NameField name={opts.queueName} pos={namePos} />
+        </Box>
+        <Box paddingLeft={3} flexDirection="column" marginTop={1}>
+          {nameError !== ''
+            ? <Text color="red">✗ {nameError}</Text>
+            : <Text color="gray" dimColor>без пробелов и символов {'/ \\ ? # \' " @'} · надёжнее всего латиница, цифры, «_» и «-»</Text>}
+          {nameError === '' && existing && existing.name !== opts.queueName && (
+            <Text color="yellow">очередь {existing.name} будет заменена очередью {opts.queueName}</Text>
+          )}
+          {nameError === '' && clash && !existing && (
+            <Text color="yellow">очередь {clash.name} уже есть — она будет перенастроена на этот аппарат</Text>
+          )}
+          {nameError === '' && existing && existing.name === opts.queueName && (
+            <Text color="green">прежнее имя сохраняется — пользователям ничего перенастраивать не нужно</Text>
+          )}
+        </Box>
+        <Box paddingLeft={2} marginTop={1}>
+          <Text color="gray" dimColor>
+            Enter — {nameError ? 'исправьте имя' : 'дальше'} · ←→ Home End по имени · Backspace стереть · Ctrl+U очистить · Esc назад
           </Text>
         </Box>
       </Frame>
@@ -463,9 +569,14 @@ export function PrinterScreen({ onExit }: Props) {
     const ipp = probe.ipp;
     // Имя изменили, а очередь с прежним именем осталась на этом же аппарате:
     // она попадёт в удаляемые, и это стоит назвать переименованием вслух.
-    const existingName = defaultQueueName(sys.queues, opts.conn);
+    const existingName = defaultQueueName(sys.queues, opts.conn, ipp?.model ?? '');
     const renaming = existingName !== opts.queueName
       && sys.queues.some(q => q.name === existingName);
+    // Детали плана — первое, чем жертвуем в низком окне: заголовки шагов и
+    // так говорят, что будет сделано, а экран выше терминала Ink ломает.
+    const fixedRows = 3 + 6 + 1 + OPT_ROWS.length + 3 + 2 + plan.length + (blocker ? 2 : 0) + 2;
+    const detailRows = plan.reduce((n, p) => n + p.detail.length, 0);
+    const showDetail = fixedRows + detailRows <= rows - 1;
     return (
       <Frame width={width} subtitle={`перевод на driverless · ${connLabel(opts.conn)}`}>
         <Box flexDirection="column" paddingLeft={3} marginBottom={1}>
@@ -506,30 +617,26 @@ export function PrinterScreen({ onExit }: Props) {
             return (
               <Box key="name" paddingLeft={2}>
                 <Text color={cur ? 'white' : 'gray'}>{cur ? '❯ ' : '  '}</Text>
-                <Text color="gray">имя очереди: </Text>
-                {editingName ? (() => {
-                  const pos = Math.min(namePos, opts.queueName.length);
-                  return (
-                    <>
-                      <Text bold color="cyan">{opts.queueName.slice(0, pos)}</Text>
-                      <Text inverse bold color="cyan">{opts.queueName.slice(pos, pos + 1) || ' '}</Text>
-                      <Text bold color="cyan">{opts.queueName.slice(pos + 1)}</Text>
-                    </>
-                  );
-                })() : (
-                  <Text bold color={cur ? 'white' : 'gray'}>{opts.queueName}</Text>
-                )}
+                <Text color={cur ? 'white' : 'gray'}>Имя принтера: </Text>
+                {editingName
+                  ? <NameField name={opts.queueName} pos={namePos} />
+                  : <>
+                      <Text bold color={cur ? 'cyan' : 'white'}>{opts.queueName}</Text>
+                      {cur && <Text color="gray" dimColor>  ← Enter — изменить</Text>}
+                    </>}
               </Box>
             );
           }
           const off = optDisabled(row);
           const on = opts[row] && !off;
+          const remark = on ? optNote(row) : '';
           return (
             <Box key={row} paddingLeft={2}>
               <Text color={cur ? 'white' : 'gray'}>{cur ? '❯ ' : '  '}</Text>
               <Text color={off ? 'gray' : on ? 'green' : 'gray'}>{on ? '[✓] ' : '[ ] '}</Text>
               <Text color={off ? 'gray' : cur ? 'white' : 'gray'} dimColor={!!off}>{OPT_TITLES[row]}</Text>
               {off && <Text color="gray" dimColor>  ({off})</Text>}
+              {remark && <Text color="gray" dimColor>  ({remark})</Text>}
             </Box>
           );
         })}
@@ -552,8 +659,10 @@ export function PrinterScreen({ onExit }: Props) {
         <Box paddingLeft={2} marginTop={1}><Text color="cyan" bold>── Будет сделано ──</Text></Box>
         {plan.map((p, i) => (
           <Box key={p.id} flexDirection="column" paddingLeft={3}>
-            <Text color={p.danger ? 'red' : 'white'}>{i + 1}. {p.title}</Text>
-            {p.detail.map((d, j) => <Text key={j} color="gray" dimColor>     {truncate(d, width - 10)}</Text>)}
+            <Text color={p.danger ? 'red' : 'white'}>{i + 1}. {truncate(p.title, width - 10)}</Text>
+            {(showDetail || p.danger) && p.detail.map((d, j) => (
+              <Text key={j} color="gray" dimColor>     {truncate(d, width - 10)}</Text>
+            ))}
           </Box>
         ))}
 
@@ -679,7 +788,7 @@ export function PrinterScreen({ onExit }: Props) {
       <Box paddingLeft={2} marginTop={1}>
         <Text color="gray" dimColor>
           {focus === 'queues'
-            ? '↑↓ выбор очереди · Tab к действиям · Q/Esc выход'
+            ? '↑↓ выбор очереди · Enter диагностика · Tab к действиям · Q/Esc выход'
             : '↑↓ выбор · Enter выполнить · Tab к очередям · Q/Esc выход'}
         </Text>
       </Box>
@@ -697,9 +806,20 @@ const ADVICE: Record<Diagnosis['advice'], string> = {
   none:    'проблем не найдено',
 };
 
-function DiagnosisView({ width, diag }: { width: number; diag: Diagnosis }) {
+function DiagnosisView({ width, rows, diag }: { width: number; rows: number; diag: Diagnosis }) {
   const q = diag.queue;
   const p = diag.probe;
+  // Журнал — самое длинное и самое необязательное: он получает то, что
+  // осталось от высоты окна после всего остального.
+  const dups = duplicateJobs(diag.jobs);
+  const wrapped = (s: string) => Math.max(1, Math.ceil((s.length + 6) / Math.max(20, width - 4)));
+  const used = 3 + 4
+    + (p ? 1 + 3 + (p.ipp ? 3 + p.ipp.markers.length : 1) + (p.usbPending ? 1 : 0) + 1 : 0)
+    + (diag.jobs.length ? 2 + dups.length : 0)
+    + 2 + (diag.problems.length ? diag.problems.reduce((n, x) => n + wrapped(x), 0) : 1)
+    + 1;
+  const journalMax = Math.max(0, rows - 1 - used - 2);
+  const journal = diag.journal.slice(-journalMax);
   const mark = (v: boolean | undefined, yes: string, no: string) =>
     v === undefined ? <Text color="gray" dimColor>не проверялось</Text>
       : v ? <Text color="green">{yes}</Text> : <Text color="red">{no}</Text>;
@@ -719,8 +839,9 @@ function DiagnosisView({ width, diag }: { width: number; diag: Diagnosis }) {
           <Text color="cyan">МФУ {connLabel(p.conn)}</Text>
           {p.conn.kind === 'net' ? (
             <>
-              <Text>  ping:        {mark(p.reachable, 'отвечает', 'не отвечает')}</Text>
-              <Text>  порт 631:    {mark(p.reachable ? p.ippOpen : undefined, 'открыт', 'закрыт')}</Text>
+              <Text>  ping:        {p.ping ? <Text color="green">отвечает</Text>
+                : <Text color={p.ippOpen ? 'gray' : 'red'}>не отвечает{p.ippOpen ? ' (ICMP закрыт — не страшно)' : ''}</Text>}</Text>
+              <Text>  порт 631:    {mark(p.ippOpen, 'открыт', 'закрыт')}</Text>
             </>
           ) : (
             <>
@@ -750,17 +871,20 @@ function DiagnosisView({ width, diag }: { width: number; diag: Diagnosis }) {
         </Box>
       )}
 
-      {diag.journal.length > 0 && (
+      {journal.length > 0 && (
         <Box flexDirection="column" paddingLeft={3} marginBottom={1}>
-          <Text color="cyan">Журнал cups (ошибки бэкенда)</Text>
-          {diag.journal.map((l, i) => <Text key={i} color="gray" dimColor>  {truncate(l, width - 8)}</Text>)}
+          <Text color="cyan">
+            Журнал cups/ipp-usb за 7 дней
+            {journal.length < diag.journal.length ? <Text color="gray"> (последние {journal.length} из {diag.journal.length})</Text> : null}
+          </Text>
+          {journal.map((l, i) => <Text key={i} color="gray" dimColor>  {truncate(l, width - 8)}</Text>)}
         </Box>
       )}
 
       {diag.jobs.length > 0 && (
         <Box flexDirection="column" paddingLeft={3} marginBottom={1}>
           <Text color="cyan">В очереди {diag.jobs.length}</Text>
-          {duplicateJobs(diag.jobs).map(d => (
+          {dups.map(d => (
             <Text key={d.title} color="yellow">
               {'  '}«{truncate(d.title, Math.max(10, width - 24))}» — {d.count} раз
             </Text>
@@ -782,6 +906,20 @@ function DiagnosisView({ width, diag }: { width: number; diag: Diagnosis }) {
   );
 }
 
+// ─── поле имени ──────────────────────────────────────────────────────────────
+
+/** Имя с курсором: символ под курсором инвертирован, в конце — пустая клетка. */
+function NameField({ name, pos }: { name: string; pos: number }) {
+  const at = Math.min(pos, name.length);
+  return (
+    <>
+      <Text bold color="cyan">{name.slice(0, at)}</Text>
+      <Text inverse bold color="cyan">{name.slice(at, at + 1) || ' '}</Text>
+      <Text bold color="cyan">{name.slice(at + 1)}</Text>
+    </>
+  );
+}
+
 // ─── общая рамка ─────────────────────────────────────────────────────────────
 
 function Frame({ width, subtitle, children }: {
@@ -797,6 +935,31 @@ function Frame({ width, subtitle, children }: {
       {children}
     </Box>
   );
+}
+
+/**
+ * Строки результата, заранее разбитые по ширине: прокрутка считает строки
+ * экрана, а перенос, сделанный самим Ink, сбил бы счёт. Цвет — по значку
+ * исходной строки, и продолжение переноса красится так же.
+ */
+function resultLines(lines: string[], width: number): { text: string; color: string }[] {
+  const w = Math.max(20, width);
+  const out: { text: string; color: string }[] = [];
+  for (const l of lines) {
+    const color = l.startsWith('✓') ? 'green' : l.startsWith('✗') ? 'red' : l.startsWith('•') ? 'yellow' : 'gray';
+    if (l.length <= w) { out.push({ text: l, color }); continue; }
+    let rest = l;
+    let first = true;
+    while (rest.length) {
+      const room = first ? w : w - 2;
+      let cut = rest.length <= room ? rest.length : rest.lastIndexOf(' ', room);
+      if (cut <= 0) cut = Math.min(room, rest.length);
+      out.push({ text: (first ? '' : '  ') + rest.slice(0, cut).trimEnd(), color });
+      rest = rest.slice(cut).trimStart();
+      first = false;
+    }
+  }
+  return out;
 }
 
 function truncate(s: string, n: number): string {

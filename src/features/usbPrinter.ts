@@ -108,9 +108,11 @@ function normalize(s: string): string {
 export function matchesDevice(info: PrinterInfo, p: UsbPrinter): boolean {
   const sn = info.deviceId.match(/(?:^|;)\s*(?:SN|SERN)\s*:\s*([^;]+)/i)?.[1]?.trim();
   if (sn && p.serial) return normalize(sn) === normalize(p.serial);
-  if (!p.model) return false;
-  return normalize(info.model).includes(normalize(p.model))
-      || normalize(p.model).includes(normalize(info.model));
+  // Пустая модель с любой стороны совпала бы с чем угодно: includes('')
+  // истинно всегда, и при двух USB-принтерах взяли бы первый попавшийся порт.
+  const mine = normalize(p.model), theirs = normalize(info.model);
+  if (!mine || !theirs) return false;
+  return theirs.includes(mine) || mine.includes(theirs);
 }
 
 /**

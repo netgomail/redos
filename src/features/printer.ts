@@ -222,18 +222,24 @@ export function parseQueues(v: string[], p: string[], d: string[], o: string[]):
 }
 
 export async function listQueues(): Promise<PrintQueue[]> {
-  const [v, p, d, o] = await Promise.all([
+  const [v, p, d, o, a] = await Promise.all([
     lines(['lpstat', '-v']), lines(['lpstat', '-p']),
     lines(['lpstat', '-d']), lines(['lpstat', '-o']),
+    lines(['lpstat', '-a']),
   ]);
   const queues = parseQueues(v, p, d, o);
   const conf = readFile('/etc/cups/printers.conf') ?? '';
-  await Promise.all(queues.map(async q => {
-    const acc = await lines(['lpstat', '-a', q.name], 10_000);
-    q.accepting   = !acc.some(l => /not accepting/i.test(l));
+  const rejecting = notAccepting(a);
+  for (const q of queues) {
+    q.accepting   = !rejecting.has(q.name);
     q.errorPolicy = errorPolicyFrom(conf, q.name);
-  }));
+  }
   return queues;
+}
+
+/** Очереди из lpstat -a, которые не принимают задания: «HP not accepting requests since ...». */
+export function notAccepting(a: string[]): Set<string> {
+  return new Set(a.map(l => l.match(/^(\S+) not accepting/)?.[1]).filter((n): n is string => !!n));
 }
 
 /** ErrorPolicy очереди из printers.conf (читается под root). */
@@ -369,8 +375,10 @@ export interface PrinterProbe {
   /** Куда реально ходим по IPP: IP аппарата или 127.0.0.1 для ipp-usb. */
   host:      string;
   port:      number;
-  /** Аппарат на связи: сеть — ping, USB — устройство на месте и ipp-usb его поднял. */
+  /** Аппарат на связи: сеть — ping или порт 631, USB — ipp-usb его поднял. */
   reachable: boolean;
+  /** Ответ на ping. Только для сведения: ICMP часто закрыт, а IPP при этом работает. */
+  ping:      boolean;
   ippOpen:   boolean;
   escl:      boolean;
   ipp:       PrinterInfo | null;
@@ -446,17 +454,21 @@ async function probeIpp(res: PrinterProbe): Promise<void> {
 
 export async function probePrinter(conn: Conn): Promise<PrinterProbe> {
   const res: PrinterProbe = {
-    conn, host: '', port: 631, reachable: false, ippOpen: false, escl: false,
+    conn, host: '', port: 631, reachable: false, ping: false, ippOpen: false, escl: false,
     ipp: null, ippError: '', ippUsb: { installed: false, active: false },
     usbBlock: '', usbPending: '',
   };
 
   if (conn.kind === 'net') {
+    // ping и порт — параллельно и на равных: во многих сетях ICMP до принтеров
+    // закрыт, и аппарат, отвечающий по IPP, нельзя объявлять недоступным.
     res.host = conn.ip;
-    res.reachable = await pingHost(conn.ip);
-    if (!res.reachable) return res;
-    const [open, escl] = await Promise.all([checkPort(conn.ip, 631), probeEscl(conn.ip)]);
+    const [ping, open, escl] = await Promise.all([
+      pingHost(conn.ip), checkPort(conn.ip, 631), probeEscl(conn.ip),
+    ]);
+    res.ping = ping;
     res.ippOpen = open;
+    res.reachable = ping || open;
     res.escl = escl.ok;
     if (open) await probeIpp(res);
     return res;
@@ -474,11 +486,20 @@ export async function probePrinter(conn: Conn): Promise<PrinterProbe> {
 
   res.port = port;
   res.reachable = true;
+  res.ping = true;
   res.ippOpen = true;
   await probeIpp(res);
   const escl = await probeEscl(res.host, port);
   res.escl = escl.ok;
   return res;
+}
+
+/**
+ * Можно ли настраивать сканер. У USB, пока ipp-usb не поднят, спросить eSCL
+ * негде — это выяснится в ходе перевода, поэтому «можно».
+ */
+export function scannerPossible(p: PrinterProbe): boolean {
+  return p.escl || (p.conn.kind === 'usb' && !p.ippOpen);
 }
 
 /** Почему перевод на этот аппарат невозможен; пустая строка — можно. */
@@ -490,7 +511,7 @@ export function migrationBlocker(p: PrinterProbe): string {
     // спрашивать сейчас не о чем.
     if (!p.ippOpen) return '';
   } else {
-    if (!p.reachable) return `${p.conn.ip} не отвечает на ping — МФУ выключен или недоступен по сети`;
+    if (!p.reachable) return `${p.conn.ip} не отвечает ни на ping, ни на порт 631 — МФУ выключен или недоступен по сети`;
     if (!p.ippOpen)   return `порт 631 (IPP) на ${p.conn.ip} закрыт — включите IPP в веб-интерфейсе МФУ`;
   }
   if (!p.ipp) return `МФУ не ответил по IPP${p.ippError ? ': ' + p.ippError : ''}`;
@@ -552,11 +573,23 @@ export interface Diagnosis {
   advice:   'migrate' | 'restore' | 'clear' | 'printer' | 'none';
 }
 
-/** Строки журнала cups, которые объясняют остановку очереди. */
-export function filterCupsJournal(journal: string[]): string[] {
+/** Сбои hplip в журнале: к очереди на IPP они отношения не имеют. */
+const HPLIP_LINE = /open device failed|unable to read device-id|Backend hp(?:fax)? returned|\bhp(?:fax)?\[\d+\]|hpmud/i;
+
+/**
+ * Строки журнала cups и ipp-usb, которые объясняют сбои печати.
+ *
+ * Сбои hplip показываются только для очереди на hplip: после перевода они
+ * остаются в журнале, и driverless-очередь иначе «унаследовала» бы чужие
+ * ошибки. Без очереди (в тестах) фильтр по бэкенду не применяется.
+ */
+export function filterCupsJournal(journal: string[], queue?: PrintQueue): string[] {
+  const hplip = !queue || isHplipBackend(queue.backend);
   return journal
-    .filter(l => /stopped due to|open device failed|unable to read device-id|returned status [1-9]|Unable to (open|connect)|Backend \S+ returned/i.test(l))
-    .slice(-6);
+    .filter(l => /stopped due to|open device failed|unable to read device-id|returned status [1-9]|Unable to (open|connect|locate|send)|Backend \S+ returned|not responding|not connected|will retry|connection (refused|reset)|timed out/i.test(l)
+      || (/ipp-usb\[/.test(l) && /error|fail|reset|timeout|closed/i.test(l)))
+    .filter(l => hplip || !HPLIP_LINE.test(l))
+    .slice(-8);
 }
 
 /**
@@ -576,13 +609,22 @@ export function connOfQueue(q: PrintQueue, usb: UsbPrinter[]): Conn | null {
   return null;
 }
 
+/** Штатные сообщения бэкенда: остаются в очереди после успешной печати. */
+const BENIGN_STATE = /^(ready|idle|rendering completed|sending data|spooling|preparing|printing|connected|waiting for job to complete|job completed)/i;
+
 export function analyze(
   queue: PrintQueue, probe: PrinterProbe | null, journal: string[], jobs: QueueJob[] = [],
 ): Diagnosis {
   const problems: string[] = [];
-  const hplipFail = journal.some(l => /open device failed|unable to read device-id/i.test(l));
+  const hplipFail = isHplipBackend(queue.backend)
+    && journal.some(l => /open device failed|unable to read device-id/i.test(l));
 
   if (!queue.enabled)   problems.push(`очередь остановлена${queue.reason ? ': ' + queue.reason : ''}`);
+  // Очередь с retry-job не останавливается, а молча повторяет задание раз в
+  // 30 секунд. Единственный след — сообщение бэкенда в lpstat -p: его и
+  // видит пользователь как «принтер недоступен».
+  else if (queue.reason && !BENIGN_STATE.test(queue.reason))
+    problems.push(`CUPS сообщает: ${queue.reason}`);
   if (!queue.accepting) problems.push('очередь не принимает задания');
   if (isHplipBackend(queue.backend))
     problems.push(queue.conn === 'usb'
@@ -633,10 +675,10 @@ export async function diagnose(queue: PrintQueue, usb: UsbPrinter[] = []): Promi
   const conn = connOfQueue(queue, usb);
   const [probe, journal, jobs] = await Promise.all([
     conn ? probePrinter(conn) : Promise.resolve(null),
-    lines(['journalctl', '-u', 'cups', '--since', '-30 days', '--no-pager'], 20_000),
+    lines(['journalctl', '-u', 'cups', '-u', 'ipp-usb', '--since', '-7 days', '--no-pager'], 20_000),
     listJobs(queue.name),
   ]);
-  return analyze(queue, probe, filterCupsJournal(journal), jobs);
+  return analyze(queue, probe, filterCupsJournal(journal, queue), jobs);
 }
 
 // ─── действия над очередью ───────────────────────────────────────────────────
@@ -740,22 +782,52 @@ export function isSameDevice(q: PrintQueue, c: Conn): boolean {
 export function queueNameError(name: string): string {
   if (!name) return 'имя очереди не может быть пустым';
   if (name.length > 127) return 'имя длиннее 127 символов';
-  const bad = [...name].find(c => c === '/' || c === '#' || c === ' ' || c.charCodeAt(0) < 0x20);
-  if (bad !== undefined) return `в имени нельзя ${bad === ' ' ? 'пробел' : `«${bad}»`}`;
+  // Тот же набор, что отвергает validate_name в lpadmin; «@» отделяет хост.
+  const bad = [...name].find(c => '/\\?\'"#@ '.includes(c) || c.charCodeAt(0) < 0x20 || c.charCodeAt(0) === 0x7f);
+  if (bad !== undefined) return `в имени нельзя ${bad === ' ' ? 'пробел' : bad.charCodeAt(0) < 0x20 || bad.charCodeAt(0) === 0x7f ? 'управляющие символы' : `«${bad}»`}`;
   return '';
 }
 
-/** Имя очереди по умолчанию: сохраняем то, к которому привыкли пользователи. */
-export function defaultQueueName(queues: PrintQueue[], c: Conn): string {
+/** Модель в имя очереди: только латиница, цифры и «_». */
+function nameFromModel(model: string): string {
+  return model.replace(/[^A-Za-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 60);
+}
+
+/**
+ * Имя очереди по умолчанию: сохраняем то, к которому привыкли пользователи.
+ *
+ * Новой очереди — имя по модели, которую назвал сам аппарат по IPP: так
+ * в списке печати видно, что это за принтер, у какого угодно производителя.
+ * У сетевого к модели добавляется последний октет адреса — одинаковых МФУ в
+ * сети бывает несколько.
+ */
+export function defaultQueueName(queues: PrintQueue[], c: Conn, model = ''): string {
   const mine = queues.filter(q => isSameDevice(q, c));
   const pick = mine.find(q => q.isDefault && isDriverless(q))
     ?? mine.find(q => isDriverless(q))
     ?? mine.find(q => q.isDefault)
     ?? mine[0];
   if (pick) return pick.name;
-  return c.kind === 'net'
-    ? `HP_MFP_${c.ip.split('.').pop()}`
-    : (usbPrinterName(c.usb).replace(/[^A-Za-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'USB_MFP');
+  if (c.kind === 'net') {
+    const octet = c.ip.split('.').pop();
+    const base = nameFromModel(model);
+    return base ? `${base}_${octet}` : `Printer_${octet}`;
+  }
+  return nameFromModel(usbPrinterName(c.usb)) || nameFromModel(model) || 'USB_Printer';
+}
+
+/**
+ * Удалять ли hplip по умолчанию.
+ *
+ * Только когда переводится аппарат HP или очередь этого аппарата сидит на
+ * hplip. Перевод Kyocera или Canon не повод сносить пакет, про который
+ * администратор, может быть, и не вспоминал: снять галочку он всегда успеет.
+ */
+export function suggestRemoveHplip(s: SystemState, c: Conn, model = ''): boolean {
+  if (s.hplip.length === 0) return false;
+  if (s.queues.some(q => isHplipBackend(q.backend) && isSameDevice(q, c))) return true;
+  const vendor = c.kind === 'usb' ? `${c.usb.vendor} ${c.usb.model}` : '';
+  return /\bHP\b|hewlett/i.test(`${model} ${vendor}`);
 }
 
 /**
@@ -851,7 +923,7 @@ export function planMigration(s: SystemState, o: MigrateOptions, probe: PrinterP
       title: 'Отключить автообнаружение принтеров', detail });
   }
 
-  if (o.scanner) {
+  if (o.scanner && scannerPossible(probe)) {
     if (!s.saneAirscan) steps.push({ id: 'airscan-install', danger: false,
       title: 'Установить sane-airscan', detail: ['dnf install -y sane-airscan'] });
     const url = probe.ippOpen ? esclUrl(probe) : 'http://127.0.0.1:<порт ipp-usb>/eSCL/';
@@ -1081,7 +1153,13 @@ export async function migrate(
     done('автообнаружение принтеров отключено');
   }
 
-  // 5. сканер
+  // 5. сканер. У USB eSCL впервые проверен только что, после подъёма ipp-usb:
+  //    не ответил — конфиг не пишем, иначе scanimage искал бы пустоту.
+  if ((plan.has('airscan') || plan.has('airscan-install')) && !probe.escl) {
+    plan.delete('airscan-install');
+    plan.delete('airscan');
+    note('сканер не настроен: аппарат не ответил по eSCL');
+  }
   if (plan.has('airscan-install')) {
     onStep('Устанавливаю sane-airscan...');
     const r = await sys(['dnf', 'install', '-y', 'sane-airscan'], 600_000);
@@ -1133,7 +1211,7 @@ export async function migrate(
   // 8. итог
   onStep('Проверяю результат...');
   res.after = (await lines(['lpstat', '-v'])).filter(l => l.trim());
-  if (o.scanner) {
+  if (o.scanner && probe.escl) {
     res.scanners = (await lines(['scanimage', '-L'], 70_000))
       .filter(l => /^device /.test(l.trim()));
   }
