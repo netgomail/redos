@@ -104,6 +104,8 @@ export function PrinterScreen({ onExit }: Props) {
   const [optIdx, setOptIdx] = useState(0);
   const [optionsBack, setOptionsBack] = useState<Phase>('pick');
   const [editingName, setEditingName] = useState(false);
+  // Где правим имя: стрелками ←→ по строке, чтобы менять не только с конца.
+  const [namePos, setNamePos] = useState(0);
 
   const [log, setLog] = useState<string[]>([]);
   const [runTitle, setRunTitle] = useState('');
@@ -274,14 +276,25 @@ export function PrinterScreen({ onExit }: Props) {
       // Правка имени перехватывает весь ввод: иначе «d» из имени запустило бы
       // перевод, а пробел переключил бы параметр.
       if (editingName && opts) {
+        const name = opts.queueName;
+        const pos = Math.min(namePos, name.length);
+        const setName = (next: string, at: number) => {
+          setOpts({ ...opts, queueName: next });
+          setNamePos(Math.max(0, Math.min(at, next.length)));
+        };
+
         if (key.return || key.escape) { setEditingName(false); return; }
-        if (key.ctrl && char === 'u') { setOpts({ ...opts, queueName: '' }); return; }
+        if (key.leftArrow)  { setNamePos(Math.max(0, pos - 1)); return; }
+        if (key.rightArrow) { setNamePos(Math.min(name.length, pos + 1)); return; }
+        if (key.ctrl && char === 'u') { setName('', 0); return; }
+        // Backspace приходит и как backspace, и как delete — зависит от
+        // терминала. Оба стирают символ слева: так же ведёт себя поле IP рядом.
         if (key.backspace || key.delete) {
-          setOpts({ ...opts, queueName: opts.queueName.slice(0, -1) });
+          if (pos > 0) setName(name.slice(0, pos - 1) + name.slice(pos), pos - 1);
           return;
         }
         if (char && !key.ctrl && !key.meta && char.charCodeAt(0) >= 0x20) {
-          setOpts({ ...opts, queueName: opts.queueName + char });
+          setName(name.slice(0, pos) + char + name.slice(pos), pos + char.length);
         }
         return;
       }
@@ -291,7 +304,7 @@ export function PrinterScreen({ onExit }: Props) {
       if (key.downArrow) setOptIdx(i => Math.min(OPT_ROWS.length - 1, i + 1));
       if ((char === ' ' || key.return) && opts) {
         const row: OptRow = OPT_ROWS[optIdx];
-        if (row === 'name') { setEditingName(true); return; }
+        if (row === 'name') { setEditingName(true); setNamePos(opts.queueName.length); return; }
         if (!optDisabled(row)) setOpts({ ...opts, [row]: !opts[row] });
         return;
       }
@@ -494,8 +507,18 @@ export function PrinterScreen({ onExit }: Props) {
               <Box key="name" paddingLeft={2}>
                 <Text color={cur ? 'white' : 'gray'}>{cur ? '❯ ' : '  '}</Text>
                 <Text color="gray">имя очереди: </Text>
-                <Text bold color={editingName ? 'cyan' : cur ? 'white' : 'gray'}>{opts.queueName}</Text>
-                {editingName && <Text inverse> </Text>}
+                {editingName ? (() => {
+                  const pos = Math.min(namePos, opts.queueName.length);
+                  return (
+                    <>
+                      <Text bold color="cyan">{opts.queueName.slice(0, pos)}</Text>
+                      <Text inverse bold color="cyan">{opts.queueName.slice(pos, pos + 1) || ' '}</Text>
+                      <Text bold color="cyan">{opts.queueName.slice(pos + 1)}</Text>
+                    </>
+                  );
+                })() : (
+                  <Text bold color={cur ? 'white' : 'gray'}>{opts.queueName}</Text>
+                )}
               </Box>
             );
           }
@@ -540,7 +563,7 @@ export function PrinterScreen({ onExit }: Props) {
         <Box paddingLeft={2} marginTop={1}>
           <Text color="gray" dimColor>
             {editingName
-              ? 'вводите имя · Ctrl+U очистить · Enter готово'
+              ? '←→ по имени · Backspace стереть · Ctrl+U очистить · Enter готово'
               : `↑↓ параметр · Enter/Пробел ${OPT_ROWS[optIdx] === 'name' ? 'править имя' : 'переключить'} · ` +
                 `${blocker || nameError ? '' : 'D применить · '}Esc назад`}
           </Text>
