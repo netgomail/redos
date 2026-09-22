@@ -107,6 +107,13 @@ describe('правило udev', () => {
   test('вызывает скрипт решения', () => {
     expect(rules).toContain('RUN+="/usr/local/sbin/redos-block-usb.sh $devpath"');
   });
+
+  test('рубеж по блочному узлу — только для дисков на USB', () => {
+    const line = rules.split('\n').find(l => l.startsWith('SUBSYSTEM=="block"'))!;
+    expect(line).toContain('ENV{DEVTYPE}=="disk"');
+    expect(line).toContain('SUBSYSTEMS=="usb"');
+    expect(line).toContain('--storage $devpath');
+  });
 });
 
 describe('категории устройства', () => {

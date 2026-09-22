@@ -93,10 +93,11 @@ function removeLegacyFiles(): number {
  * Версия 2 — udev-политика; 1 была у файла правил USBGuard. Версия 3 добавила
  * второй рубеж по блочному узлу и опознание накопителя по SCSI-переносу.
  * Версия 4 перестала блокировать устройство из-за класса, не покрытого ни
- * одной категорией, — из-за него не проходил ни один принтер HP. Всё это
+ * одной категорией, — из-за него не проходил ни один принтер HP. Версия 5
+ * сузила рубеж по блочному узлу до дисков на USB (SUBSYSTEMS=="usb"). Всё это
  * живёт в скрипте и правиле, поэтому старую установку нужно переприменить.
  */
-const POLICY_VERSION  = 4;
+const POLICY_VERSION  = 5;
 const VERSION_MARK    = '# redos-device-control-version:';
 const CATEGORIES_MARK = '# redos-device-control-categories:';
 // ─── категории устройств ─────────────────────────────────────────────────────
@@ -1064,6 +1065,10 @@ export function parseAppliedPolicy(text: string | null): PolicyInput | null {
  * подставившее идентификаторы известного накопителя, получит usb-storage —
  * класс при этом остаётся разрешённым, и первый рубеж его пропустит.
  * Появившийся /dev/sdX подделать уже нечем: это факт, а не заявление.
+ *
+ * SUBSYSTEMS=="usb" ищет USB вверх по цепочке родителей (udev(7)): диски
+ * loop, NVMe и device-mapper скрипт больше не будят. Замаскированный
+ * накопитель это не пропускает — он висит на USB, как бы себя ни объявлял.
  */
 export function generateRules(): string {
   return [
@@ -1078,7 +1083,7 @@ export function generateRules(): string {
     '',
     '# Рубеж по факту: блочный узел на USB-устройстве, которому накопитель',
     '# не разрешён. Проверка идёт вместо класса, а не вместе с ним.',
-    `SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", RUN+="${BLOCK_SCRIPT} --storage $devpath", GOTO="redos_dc_end"`,
+    `SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", SUBSYSTEMS=="usb", RUN+="${BLOCK_SCRIPT} --storage $devpath", GOTO="redos_dc_end"`,
     '',
     'SUBSYSTEM!="usb",          GOTO="redos_dc_end"',
     'ENV{DEVTYPE}!="usb_interface", GOTO="redos_dc_end"',
