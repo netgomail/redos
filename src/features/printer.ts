@@ -687,7 +687,13 @@ export function analyze(
     if (probe.usbPending) problems.push(probe.usbPending);
     const reasons = probe.ipp ? blockingReasons(probe.ipp.reasons) : [];
     if (reasons.length) { problems.push(`МФУ сообщает: ${reasons.join(', ')}`); printerBad = true; }
-    if (probe.ipp?.state === 'stopped') { problems.push('МФУ в состоянии stopped'); printerBad = true; }
+    // stopped без единой причины — не поломка: Катюша M348/M247 сообщает так
+    // всегда, в том числе посреди нормальной печати. Настоящую остановку
+    // аппарат сопровождает причиной (замятие, открыта дверца, нет бумаги).
+    if (probe.ipp?.state === 'stopped') {
+      if (probe.ipp.reasons.length) { problems.push('МФУ в состоянии stopped'); printerBad = true; }
+      else problems.push('МФУ сообщает stopped без причины — у части прошивок это норма, если печать идёт');
+    }
     const paper = paperMismatch(probe.ipp);
     if (paper) problems.push(paper);
   }

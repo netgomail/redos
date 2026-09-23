@@ -686,3 +686,20 @@ describe('автообнаружение', () => {
     expect(step?.detail.join(' ')).toContain('HP_206');
   });
 });
+
+describe('состояние stopped', () => {
+  const q = parseQueues(['device for K: ipp://10.82.230.207/ipp/print'], ['printer K is idle.  enabled since Mon'], [], [])[0];
+  const withState = (reasons: string[]) =>
+    probe({ ipp: { ...probe().ipp!, state: 'stopped', reasons } });
+
+  test('без причины — пометка, но не поломка (прошивка Катюши)', () => {
+    const d = analyze({ ...q, errorPolicy: 'retry-job' }, withState([]), []);
+    expect(d.advice).toBe('none');
+    expect(d.problems.join(' ')).toContain('без причины');
+  });
+
+  test('с причиной — аппарат неисправен', () => {
+    const d = analyze({ ...q, errorPolicy: 'retry-job' }, withState(['media-empty-report']), []);
+    expect(d.advice).toBe('printer');
+  });
+});

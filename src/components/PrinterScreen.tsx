@@ -605,7 +605,7 @@ export function PrinterScreen({ onExit }: Props) {
           {ipp && (
             <Text>
               <Text color="gray">Сейчас:  </Text>
-              <Text color={ipp.state === 'stopped' ? 'red' : 'green'}>{ipp.state}</Text>
+              <Text color={ipp.state !== 'stopped' ? 'green' : ipp.reasons.length ? 'red' : 'yellow'}>{ipp.state}</Text>
               {ipp.reasons.length ? <Text color="yellow">  {ipp.reasons.join(', ')}</Text> : null}
               {ipp.markers.map(m => <Text key={m.name} color="gray">  тонер {m.level >= 0 ? m.level + '%' : '?'}</Text>)}
             </Text>
@@ -877,7 +877,7 @@ function DiagnosisView({ width, rows, diag }: { width: number; rows: number; dia
           {p.ipp ? (
             <>
               <Text>  модель:      {p.ipp.model || '—'}</Text>
-              <Text>  состояние:   <Text color={p.ipp.state === 'stopped' ? 'red' : 'green'}>{p.ipp.state}</Text>
+              <Text>  состояние:   <Text color={p.ipp.state !== 'stopped' ? 'green' : p.ipp.reasons.length ? 'red' : 'yellow'}>{p.ipp.state}</Text>
                 {p.ipp.reasons.length ? <Text color="yellow">  {p.ipp.reasons.join(', ')}</Text> : null}
               </Text>
               {p.ipp.markers.map(m => (
