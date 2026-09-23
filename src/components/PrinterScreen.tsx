@@ -6,7 +6,7 @@ import {
   findCandidates, probePrinter, planMigration, migrate, migrationBlocker,
   defaultQueueName, discoveryHidden, isHplipBackend, isDriverless, isIpv4,
   connLabel, connKey, connOfQueue, hplipKept, duplicateJobs, queueNameError,
-  scannerPossible, suggestRemoveHplip,
+  scannerPossible, suggestRemoveHplip, paperMismatch, isSameDevice, mdnsQueues,
 } from '../features/printer';
 import { usbPrinterName } from '../features/usbPrinter';
 import type {
@@ -58,11 +58,11 @@ const ACTIONS: Action[] = [
 type OptKey = 'testPage' | 'removeHplip' | 'hideDiscovery' | 'scanner' | 'removeOthers';
 
 const OPT_TITLES: Record<OptKey, string> = {
-  testPage:      'тестовая страница перед удалением hplip',
+  testPage:      'тестовая страница',
   removeHplip:   'удалить hplip',
   hideDiscovery: 'отключить автообнаружение (cups-browsed, avahi, общий доступ)',
   scanner:       'сканер по eSCL (sane-airscan по адресу, без автопоиска)',
-  removeOthers:  'удалить и все остальные очереди',
+  removeOthers:  'удалить с этого компьютера остальные принтеры',
 };
 const OPT_KEYS = Object.keys(OPT_TITLES) as OptKey[];
 
@@ -262,12 +262,27 @@ export function PrinterScreen({ onExit }: Props) {
     if (k === 'removeHplip' && sys.hplip.length === 0) return 'не установлен';
     if (k === 'hideDiscovery' && discoveryHidden(sys) && sys.sharing === 'off') return 'уже отключено';
     if (k === 'scanner' && !scannerPossible(probe)) return 'МФУ не отвечает по eSCL';
+    if (k === 'removeOthers' && otherPrinters.length === 0) return 'других нет';
     return '';
   };
 
   /** Оговорка к включаемому параметру — в отличие от optDisabled, не запрещает. */
-  const optNote = (k: OptKey): string =>
-    k === 'scanner' && probe && !probe.escl && scannerPossible(probe) ? 'eSCL проверим после запуска ipp-usb' : '';
+  const optNote = (k: OptKey): string => {
+    if (k === 'scanner' && probe && !probe.escl && scannerPossible(probe)) return 'eSCL проверим после запуска ipp-usb';
+    if (k === 'hideDiscovery' && sys && mdnsQueues(sys.queues).length)
+      return `перестанут работать: ${mdnsQueues(sys.queues).map(q => q.name).join(', ')}`;
+    return '';
+  };
+
+  // hplip показываем, только когда переводится аппарат HP или тот, что сейчас
+  // на hplip: при настройке Kyocera или Катюши строка про hplip только путает.
+  const hplipRow = !!sys && !!opts && sys.hplip.length > 0
+    && suggestRemoveHplip(sys, opts.conn, probe?.ipp?.model ?? '');
+  const optRows: OptRow[] = OPT_ROWS.filter(r => r !== 'removeHplip' || hplipRow);
+  // «Очередь» для администратора — непонятное слово: называем принтеры по именам.
+  const otherPrinters = sys && opts
+    ? sys.queues.filter(q => q.name !== opts.queueName && !isSameDevice(q, opts.conn)).map(q => q.name)
+    : [];
 
   // ── ввод ────────────────────────────────────────────────────────────────────
 
@@ -347,9 +362,9 @@ export function PrinterScreen({ onExit }: Props) {
 
       if (k('q') || key.escape) { setPhase(optionsBack); return; }
       if (key.upArrow)   setOptIdx(i => Math.max(0, i - 1));
-      if (key.downArrow) setOptIdx(i => Math.min(OPT_ROWS.length - 1, i + 1));
+      if (key.downArrow) setOptIdx(i => Math.min(optRows.length - 1, i + 1));
       if ((char === ' ' || key.return) && opts) {
-        const row: OptRow = OPT_ROWS[optIdx];
+        const row: OptRow = optRows[optIdx];
         if (row === 'name') { setEditingName(true); setNamePos(opts.queueName.length); return; }
         if (!optDisabled(row)) setOpts({ ...opts, [row]: !opts[row] });
         return;
@@ -574,7 +589,7 @@ export function PrinterScreen({ onExit }: Props) {
       && sys.queues.some(q => q.name === existingName);
     // Детали плана — первое, чем жертвуем в низком окне: заголовки шагов и
     // так говорят, что будет сделано, а экран выше терминала Ink ломает.
-    const fixedRows = 3 + 6 + 1 + OPT_ROWS.length + 3 + 2 + plan.length + (blocker ? 2 : 0) + 2;
+    const fixedRows = 3 + 6 + 1 + optRows.length + 3 + 2 + plan.length + (blocker ? 2 : 0) + 2;
     const detailRows = plan.reduce((n, p) => n + p.detail.length, 0);
     const showDetail = fixedRows + detailRows <= rows - 1;
     return (
@@ -608,10 +623,13 @@ export function PrinterScreen({ onExit }: Props) {
           {probe.usbPending !== '' && (
             <Text><Text color="gray">ipp-usb: </Text><Text color="yellow">{probe.usbPending}</Text></Text>
           )}
+          {paperMismatch(ipp) !== '' && (
+            <Text><Text color="gray">Бумага:  </Text><Text color="yellow">{paperMismatch(ipp)}</Text></Text>
+          )}
         </Box>
 
         <Box paddingLeft={2}><Text color="cyan" bold>── Параметры ──</Text></Box>
-        {OPT_ROWS.map((row, i) => {
+        {optRows.map((row, i) => {
           const cur = i === optIdx;
           if (row === 'name') {
             return (
@@ -635,6 +653,9 @@ export function PrinterScreen({ onExit }: Props) {
               <Text color={cur ? 'white' : 'gray'}>{cur ? '❯ ' : '  '}</Text>
               <Text color={off ? 'gray' : on ? 'green' : 'gray'}>{on ? '[✓] ' : '[ ] '}</Text>
               <Text color={off ? 'gray' : cur ? 'white' : 'gray'} dimColor={!!off}>{OPT_TITLES[row]}</Text>
+              {row === 'removeOthers' && !off && (
+                <Text color={on ? 'red' : 'gray'}>: {truncate(otherPrinters.join(', '), Math.max(10, width - 60))}</Text>
+              )}
               {off && <Text color="gray" dimColor>  ({off})</Text>}
               {remark && <Text color="gray" dimColor>  ({remark})</Text>}
             </Box>
@@ -673,7 +694,7 @@ export function PrinterScreen({ onExit }: Props) {
           <Text color="gray" dimColor>
             {editingName
               ? '←→ по имени · Backspace стереть · Ctrl+U очистить · Enter готово'
-              : `↑↓ параметр · Enter/Пробел ${OPT_ROWS[optIdx] === 'name' ? 'править имя' : 'переключить'} · ` +
+              : `↑↓ параметр · Enter/Пробел ${optRows[optIdx] === 'name' ? 'править имя' : 'переключить'} · ` +
                 `${blocker || nameError ? '' : 'D применить · '}Esc назад`}
           </Text>
         </Box>

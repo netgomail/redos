@@ -14,8 +14,8 @@ import {
   planMigration, queuesToRemove, defaultQueueName, analyze, filterCupsJournal,
   migrationBlocker, discoveryHidden, rollbackScript, connOfUri, serialFromUri,
   isSameDevice, isDriverless, hplipQueuesLeft, hplipKept, connOfQueue,
-  parseLpq, duplicateJobs, plannedUri, esclUrl, queueNameError,
-  notAccepting, suggestRemoveHplip, scannerPossible,
+  parseLpq, duplicateJobs, plannedUri, esclUrl, queueNameError, queueUri,
+  notAccepting, suggestRemoveHplip, scannerPossible, paperMismatch, mdnsQueues,
 } from './printer';
 import type { SystemState, MigrateOptions, PrintQueue, PrinterProbe, Conn } from './printer';
 import { usbPrintersFrom, matchesDevice, usbBlocker, usbPending } from './usbPrinter';
@@ -641,5 +641,48 @@ describe('удобство', () => {
   test('аппарат без модели не совпадает с любым USB-принтером', () => {
     const info = { ...probe().ipp!, model: '', deviceId: '' };
     expect(matchesDevice(info, usbDev({ serial: '' }))).toBe(false);
+  });
+});
+
+describe('бумага', () => {
+  const info = (media: string[]) => summarize(parseIppResponse(ippResponse(
+    media.map((m, i) => [0x44, i === 0 ? 'media-ready' : '', m] as [number, string, string]),
+  )).attrs);
+
+  test('в лотке Letter, печать на A4 — предупреждение с размером', () => {
+    const w = paperMismatch(info(['na_letter_8.5x11in']));
+    expect(w).toContain('letter 8.5x11in');
+    expect(w).toContain('A4');
+  });
+
+  test('A4 хотя бы в одном лотке или аппарат не сообщает — тихо', () => {
+    expect(paperMismatch(info(['na_letter_8.5x11in', 'iso_a4_210x297mm']))).toBe('');
+    expect(paperMismatch(info([]))).toBe('');
+    expect(paperMismatch(null)).toBe('');
+  });
+});
+
+describe('IPP в TLS', () => {
+  test('после редиректа на https очередь идёт на ipps:// с портом', () => {
+    expect(queueUri(probe({ host: '10.82.101.60', port: 443, tls: true }))).toBe('ipps://10.82.101.60:443/ipp/print');
+    expect(queueUri(probe({ host: '10.82.101.53', port: 631 }))).toBe('ipp://10.82.101.53/ipp/print');
+  });
+});
+
+describe('автообнаружение', () => {
+  test('принтер по имени .local и dnssd:// зависят от avahi, по IP — нет', () => {
+    const qs = parseQueues([
+      'device for HP_206: ipp://GUB-ADM-206-4.local:631/printers/HP_LaserJet_Pro_M428f-M429f',
+      'device for Bonjour: dnssd://HP%20M428._ipp._tcp.local/',
+      'device for Kyocera: ipps://10.82.101.60:443/ipp/print',
+    ], [], [], []);
+    expect(mdnsQueues(qs).map(q => q.name)).toEqual(['HP_206', 'Bonjour']);
+  });
+
+  test('план предупреждает, какие принтеры перестанут работать', () => {
+    const s = state({ queues: parseQueues(['device for HP_206: ipp://GUB-ADM-206-4.local:631/printers/HP'], [], [], []) });
+    const step = planMigration(s, opts({ hideDiscovery: true }), probe()).find(p => p.id === 'discovery');
+    expect(step?.danger).toBe(true);
+    expect(step?.detail.join(' ')).toContain('HP_206');
   });
 });

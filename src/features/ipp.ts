@@ -136,20 +136,31 @@ export function parseIppResponse(buf: Uint8Array): IppResponse {
  * между ними нет.
  */
 export async function getPrinterAttributes(
-  host: string, port = 631, timeoutMs = 8000,
-): Promise<IppResponse> {
-  const printerUri = port === 631 ? `ipp://${host}/ipp/print` : `ipp://${host}:${port}/ipp/print`;
+  host: string, port = 631, timeoutMs = 8000, tls = false,
+): Promise<IppResponse & { tls: boolean; port: number }> {
+  const printerUri = `${tls ? 'ipps' : 'ipp'}://${host}${port === 631 ? '' : ':' + port}/ipp/print`;
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const resp = await fetch(`http://${host}:${port}/ipp/print`, {
+    const resp = await fetch(`${tls ? 'https' : 'http'}://${host}:${port}/ipp/print`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/ipp' },
       body: encodeGetPrinterAttributes(printerUri),
       signal: ctrl.signal,
+      redirect: 'manual',
+      // У МФУ сертификат самоподписанный: проверять его не с чем.
+      tls: { rejectUnauthorized: false },
     });
+    // Аппарат с выключенным простым IPP (Kyocera с «IPP over SSL») отвечает на
+    // 631 редиректом на https://host:443/ — там тот же IPP, только в TLS.
+    const loc = resp.headers.get('location') ?? '';
+    if (!tls && resp.status >= 300 && resp.status < 400 && /^https:/i.test(loc)) {
+      const u = new URL(loc);
+      clearTimeout(t);
+      return getPrinterAttributes(host, Number(u.port) || 443, timeoutMs, true);
+    }
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    return parseIppResponse(new Uint8Array(await resp.arrayBuffer()));
+    return { ...parseIppResponse(new Uint8Array(await resp.arrayBuffer())), tls, port };
   } finally {
     clearTimeout(t);
   }
@@ -208,10 +219,10 @@ export function fixInvalidUris(buf: Uint8Array, replacement: string): { buf: Uin
  * прокси, после чего очередь переводится на настоящий адрес аппарата. Бэкенд
  * ipp при печати ответ так строго не проверяет.
  */
-export function startFixingProxy(host: string, port = 631): {
+export function startFixingProxy(host: string, port = 631, tls = false): {
   port: number; fixed: Set<string>; stop: () => void;
 } {
-  const target = `http://${host}:${port}`;
+  const target = `${tls ? 'https' : 'http'}://${host}:${port}`;
   const fixed = new Set<string>();
   const server = Bun.serve({
     hostname: '127.0.0.1',
@@ -221,6 +232,7 @@ export function startFixingProxy(host: string, port = 631): {
         method: req.method,
         headers: { 'Content-Type': 'application/ipp' },
         body: req.method === 'POST' ? await req.arrayBuffer() : undefined,
+        tls: { rejectUnauthorized: false },
       });
       const r = fixInvalidUris(new Uint8Array(await resp.arrayBuffer()), `${target}/`);
       r.fixed.forEach(f => fixed.add(f));

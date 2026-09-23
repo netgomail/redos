@@ -375,6 +375,8 @@ export interface PrinterProbe {
   /** Куда реально ходим по IPP: IP аппарата или 127.0.0.1 для ipp-usb. */
   host:      string;
   port:      number;
+  /** IPP в TLS (ipps://): аппарат перенаправил простой IPP на https. */
+  tls?:      boolean;
   /** Аппарат на связи: сеть — ping или порт 631, USB — ipp-usb его поднял. */
   reachable: boolean;
   /** Ответ на ping. Только для сведения: ICMP часто закрыт, а IPP при этом работает. */
@@ -439,7 +441,7 @@ export function esclUrl(p: PrinterProbe): string {
 
 /** URI очереди CUPS для этого аппарата. */
 export function queueUri(p: PrinterProbe): string {
-  return p.port === 631 ? `ipp://${p.host}/ipp/print` : `ipp://${p.host}:${p.port}/ipp/print`;
+  return `${p.tls ? 'ipps' : 'ipp'}://${p.host}${p.port === 631 ? '' : ':' + p.port}/ipp/print`;
 }
 
 async function probeIpp(res: PrinterProbe): Promise<void> {
@@ -447,6 +449,9 @@ async function probeIpp(res: PrinterProbe): Promise<void> {
     const r = await getPrinterAttributes(res.host, res.port);
     if (r.status >= 0x0100) res.ippError = `IPP status 0x${r.status.toString(16).padStart(4, '0')}`;
     else res.ipp = summarize(r.attrs);
+    // очередь пойдёт туда же, куда ответил аппарат, — в том числе после редиректа на https
+    res.port = r.port;
+    res.tls = r.tls;
   } catch (e) {
     res.ippError = (e as Error).message;
   }
@@ -609,6 +614,32 @@ export function connOfQueue(q: PrintQueue, usb: UsbPrinter[]): Conn | null {
   return null;
 }
 
+/** Имя носителя PWG для человека: na_letter_8.5x11in → letter 8.5x11in. */
+function mediaLabel(m: string): string {
+  return m.replace(/^(iso|na|jis|jpn|oe|om|prc|roc)_/, '').replace(/_/g, ' ');
+}
+
+/**
+ * Бумага в лотке по данным самого МФУ не A4, а очереди печатают на A4.
+ *
+ * Размер в лотке аппарат обычно не измеряет, а берёт из своих настроек или
+ * из положения направляющих. Если там Letter, задание на A4 останавливается
+ * с «несоответствием размера бумаги», а лист длиннее ожидаемого аппарат
+ * считает замятием — снаружи это выглядит как поломка. Пустой media-ready
+ * (аппарат не сообщает) — не повод для тревоги.
+ *
+ * Это подсказка, а не диагноз: Катюша M348/M247 отдаёт media-ready=letter
+ * всегда, как бы ни стояли направляющие лотка.
+ */
+export function paperMismatch(info: PrinterInfo | null): string {
+  const ready = info?.media.filter(Boolean) ?? [];
+  if (!ready.length || ready.some(m => /^iso_a4_/i.test(m))) return '';
+  return `МФУ сообщает бумагу ${ready.map(mediaLabel).join(', ')}, а печать идёт на A4. ` +
+    'Если аппарат пишет «несоответствие размера бумаги» или замятие — проверьте размер ' +
+    'в настройках лотка на МФУ, направляющие и переключатель размера в лотке ' +
+    '(часть прошивок сообщает Letter всегда)';
+}
+
 /** Штатные сообщения бэкенда: остаются в очереди после успешной печати. */
 const BENIGN_STATE = /^(ready|idle|rendering completed|sending data|spooling|preparing|printing|connected|waiting for job to complete|job completed)/i;
 
@@ -657,6 +688,8 @@ export function analyze(
     const reasons = probe.ipp ? blockingReasons(probe.ipp.reasons) : [];
     if (reasons.length) { problems.push(`МФУ сообщает: ${reasons.join(', ')}`); printerBad = true; }
     if (probe.ipp?.state === 'stopped') { problems.push('МФУ в состоянии stopped'); printerBad = true; }
+    const paper = paperMismatch(probe.ipp);
+    if (paper) problems.push(paper);
   }
 
   // Сломанный аппарат с копиями в очереди: чинить очередь бесполезно, пока
@@ -838,6 +871,15 @@ export function suggestRemoveHplip(s: SystemState, c: Conn, model = ''): boolean
  * молча сносил рабочую очередь USB-принтера, а следом и сам hplip. Чужой
  * аппарат переводится своим запуском мастера, а не удаляется заодно.
  */
+/**
+ * Очереди на имя из mDNS (host.local) или dnssd://: живут только при avahi.
+ * После отключения автообнаружения имя перестаёт находиться, и принтер —
+ * часто расшаренный с соседнего компьютера — молча пропадает.
+ */
+export function mdnsQueues(queues: PrintQueue[]): PrintQueue[] {
+  return queues.filter(q => q.backend === 'dnssd' || /^[a-z]+:\/\/[^/:]+\.local[:/]/i.test(q.uri));
+}
+
 export function queuesToRemove(
   queues: PrintQueue[], opts: Pick<MigrateOptions, 'conn' | 'queueName' | 'removeOthers'>,
 ): PrintQueue[] {
@@ -906,7 +948,7 @@ export function planMigration(s: SystemState, o: MigrateOptions, probe: PrinterP
 
   const remove = queuesToRemove(s.queues, o);
   if (remove.length) steps.push({ id: 'remove-queues', danger: true,
-    title: `Удалить очереди: ${remove.length}`,
+    title: `Удалить принтеры с этого компьютера: ${remove.length}`,
     detail: [...remove.map(q => `${q.name} — ${q.uri}`), 'и убрать их из lpoptions пользователей'] });
 
   if (o.hideDiscovery) {
@@ -919,7 +961,10 @@ export function planMigration(s: SystemState, o: MigrateOptions, probe: PrinterP
       // напрямую — маскировка avahi на печать по USB не влияет.
       ...(o.conn.kind === 'usb' ? ['очередь ipp-usb задана по адресу и от mDNS не зависит'] : []),
     ];
-    if (detail.length) steps.push({ id: 'discovery', danger: false,
+    const broken = mdnsQueues(s.queues).filter(q => !remove.includes(q) && q.name !== o.queueName);
+    if (broken.length)
+      detail.push(`перестанут работать (найдены по имени .local): ${broken.map(q => q.name).join(', ')}`);
+    if (detail.length) steps.push({ id: 'discovery', danger: broken.length > 0,
       title: 'Отключить автообнаружение принтеров', detail });
   }
 
@@ -933,7 +978,9 @@ export function planMigration(s: SystemState, o: MigrateOptions, probe: PrinterP
 
   if (o.testPage) steps.push({ id: 'test-page', danger: false,
     title: 'Тестовая страница через новую очередь',
-    detail: ['ждать завершения до 2 минут; при неудаче hplip не удаляется'] });
+    detail: [o.removeHplip && s.hplip.length
+      ? 'ждать завершения до 2 минут; при неудаче hplip не удаляется'
+      : 'ждать завершения до 2 минут'] });
 
   if (o.removeHplip && s.hplip.length && hplipQueuesLeft(s, o).length === 0)
     steps.push({ id: 'hplip', danger: true,
@@ -1066,7 +1113,7 @@ async function addEverywhereQueue(
   if (!/returned invalid data/i.test(la.msg)) return { ...la, fixed: [] };
 
   onStep('МФУ отдал неверные данные — строю PPD через исправляющий прокси...');
-  const proxy = startFixingProxy(probe.host, probe.port);
+  const proxy = startFixingProxy(probe.host, probe.port, probe.tls);
   try {
     const viaProxy = `ipp://127.0.0.1:${proxy.port}/ipp/print`;
     const lp = await sys(['lpadmin', '-p', o.queueName, '-E', '-v', viaProxy, '-m', 'everywhere', ...opts], 90_000);
@@ -1214,6 +1261,8 @@ export async function migrate(
   }
 
   // 6. тестовая страница — от неё зависит удаление hplip
+  const paper = paperMismatch(probe.ipp);
+  if (paper) note(paper);
   let printed = !o.testPage;
   if (plan.has('test-page')) {
     onStep('Тестовая страница...');
