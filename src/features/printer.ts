@@ -36,7 +36,7 @@ import { readFile } from '../utils/fs';
 import { isRoot } from '../utils/sudo';
 import type { FixResult } from '../utils/sudo';
 import { runPty, runPtyLines, stripAnsi } from '../utils/terminal';
-import { getPrinterAttributes, summarize, blockingReasons } from './ipp';
+import { getPrinterAttributes, summarize, blockingReasons, startFixingProxy } from './ipp';
 import type { PrinterInfo } from './ipp';
 import {
   findUsbPrinters, readIppUsbState, findIppUsbPort, usbBlocker, usbPending, usbPrinterName,
@@ -1041,6 +1041,49 @@ async function printTestPage(queue: string, step: (m: string) => void): Promise<
   return { ok: true, job, msg: `задание ${job} выполнено` };
 }
 
+/**
+ * lpadmin -m everywhere с обходом битых ответов прошивки.
+ *
+ * Если lpadmin отверг ответ аппарата («Printer returned invalid data»), PPD
+ * строится повторно через локальный прокси, который этот ответ чинит, а
+ * затем очередь переводится на настоящий адрес — PPD при этом остаётся.
+ */
+async function addEverywhereQueue(
+  o: MigrateOptions, uri: string, probe: PrinterProbe, onStep: (m: string) => void,
+): Promise<{ ok: boolean; msg: string; fixed: string[] }> {
+  const opts = [
+    '-L', connLabel(o.conn),
+    '-o', 'printer-error-policy=retry-job',
+    '-o', 'sides-default=one-sided',
+    '-o', 'Duplex=None',
+  ];
+  // Бумага по умолчанию — A4: иначе берётся media-default аппарата, а у
+  // части прошивок это Letter, и задание ждёт не ту бумагу.
+  const a4 = () => sys(['lpadmin', '-p', o.queueName, '-o', 'PageSize=A4']);
+
+  const la = await sys(['lpadmin', '-p', o.queueName, '-E', '-v', uri, '-m', 'everywhere', ...opts], 90_000);
+  if (la.ok) { await a4(); return { ...la, fixed: [] }; }
+  if (!/returned invalid data/i.test(la.msg)) return { ...la, fixed: [] };
+
+  onStep('МФУ отдал неверные данные — строю PPD через исправляющий прокси...');
+  const proxy = startFixingProxy(probe.host, probe.port);
+  try {
+    const viaProxy = `ipp://127.0.0.1:${proxy.port}/ipp/print`;
+    const lp = await sys(['lpadmin', '-p', o.queueName, '-E', '-v', viaProxy, '-m', 'everywhere', ...opts], 90_000);
+    if (!lp.ok) return { ...lp, msg: `${la.msg} / через прокси: ${lp.msg}`, fixed: [] };
+  } finally {
+    proxy.stop();
+  }
+  const sv = await sys(['lpadmin', '-p', o.queueName, '-v', uri]);
+  if (!sv.ok) {
+    // очередь на адрес прокси без прокси мертва — не оставлять её
+    await sys(['lpadmin', '-x', o.queueName]);
+    return { ...sv, fixed: [] };
+  }
+  await a4();
+  return { ok: true, msg: '', fixed: [...proxy.fixed] };
+}
+
 export async function migrate(
   s: SystemState, o: MigrateOptions, probe0: PrinterProbe, onStep: (m: string) => void = () => {},
 ): Promise<MigrateResult> {
@@ -1106,12 +1149,9 @@ export async function migrate(
 
   // 2. очередь
   onStep(`Очередь ${o.queueName} → ${uri} (lpadmin опрашивает МФУ)...`);
-  const la = await sys(['lpadmin', '-p', o.queueName, '-E', '-v', uri, '-m', 'everywhere',
-    '-L', connLabel(o.conn),
-    '-o', 'printer-error-policy=retry-job',
-    '-o', 'sides-default=one-sided',
-    '-o', 'Duplex=None'], 90_000);
+  const la = await addEverywhereQueue(o, uri, probe, onStep);
   if (!la.ok) return fail(`lpadmin: ${la.msg}`);
+  if (la.fixed.length) note(`прошивка МФУ отдаёт неверные данные (${la.fixed.join(', ')}) — PPD построен в обход`);
   await sys(['cupsenable', o.queueName]);
   await sys(['cupsaccept', o.queueName]);
   await sys(['lpadmin', '-d', o.queueName]);

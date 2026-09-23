@@ -8,7 +8,7 @@
  * Запуск: bun test
  */
 import { describe, test, expect } from 'bun:test';
-import { encodeGetPrinterAttributes, parseIppResponse, summarize, blockingReasons } from './ipp';
+import { encodeGetPrinterAttributes, parseIppResponse, summarize, blockingReasons, fixInvalidUris } from './ipp';
 import {
   parseQueues, parseAirscanConf, airscanConf, stripLpoptions, errorPolicyFrom,
   planMigration, queuesToRemove, defaultQueueName, analyze, filterCupsJournal,
@@ -96,6 +96,33 @@ describe('IPP', () => {
       [0x49, 'document-format-supported', 'application/postscript'],
     ])).attrs);
     expect(info.everywhere).toBe(false);
+  });
+
+  test('битый uri от прошивки Катюши заменяется, остальное не трогается', () => {
+    const src = ippResponse([
+      [0x41, 'printer-make-and-model', 'KATUSHA M348'],
+      [0x45, 'printer-more-info', 'airprint-1.3'],
+      [0x45, 'printer-uri-supported', 'ipp://10.82.101.53/ipp/print'],
+      [0x34, 'media-col-default', ''],
+      [0x4a, '', 'media-size-name'],
+      [0x44, '', 'iso_a4_210x297mm'],
+      [0x37, '', ''],
+      [0x44, 'sides-supported', 'one-sided'],
+    ]);
+    const r = fixInvalidUris(src, 'http://10.82.101.53:631/');
+    expect(r.fixed).toEqual(['printer-more-info="airprint-1.3"']);
+    const attrs = parseIppResponse(r.buf).attrs;
+    expect(attrs.get('printer-more-info')).toEqual(['http://10.82.101.53:631/']);
+    expect(attrs.get('printer-uri-supported')).toEqual(['ipp://10.82.101.53/ipp/print']);
+    expect(attrs.get('sides-supported')).toEqual(['one-sided']);
+    expect(summarize(attrs).model).toBe('KATUSHA M348');
+  });
+
+  test('исправный ответ проходит байт в байт', () => {
+    const src = ippResponse([[0x45, 'printer-more-info', 'http://10.0.0.5/'], [0x23, 'printer-state', int(3)]]);
+    const r = fixInvalidUris(src, 'http://x/');
+    expect(r.fixed).toEqual([]);
+    expect([...r.buf]).toEqual([...src]);
   });
 
   test('мешающие печати причины отделяются от предупреждений', () => {

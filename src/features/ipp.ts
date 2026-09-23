@@ -155,6 +155,81 @@ export async function getPrinterAttributes(
   }
 }
 
+// ─── обход битых ответов прошивки ────────────────────────────────────────────
+
+const URI_SCHEME = /^[a-z][a-z0-9+.-]*:/i;
+
+/**
+ * Заменяет в ответе IPP значения типа uri без схемы на `replacement`.
+ *
+ * lpadmin из CUPS 2.4 перед построением PPD проверяет ответ аппарата и при
+ * любой ошибке отказывается целиком. Катюша M348 (прошивка 202306220) кладёт в
+ * printer-more-info строку «airprint-1.3» — и очередь не создаётся, хотя
+ * URF аппарат поддерживает. Остальные байты ответа копируются как есть,
+ * коллекции тоже: их значения идут теми же записями тег-имя-значение.
+ */
+export function fixInvalidUris(buf: Uint8Array, replacement: string): { buf: Uint8Array; fixed: string[] } {
+  if (buf.length < 9) return { buf, fixed: [] };
+  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  const dec = new TextDecoder();
+  const rep = new TextEncoder().encode(replacement);
+  const out: number[] = [...buf.subarray(0, 8)];
+  const fixed: string[] = [];
+
+  let i = 8;
+  let name = '';
+  while (i < buf.length) {
+    const tag = buf[i];
+    if (tag === TAG.end) { out.push(...buf.subarray(i)); break; }
+    if (tag < 0x10) { out.push(tag); i++; continue; }
+    if (i + 3 > buf.length) { out.push(...buf.subarray(i)); break; }
+    const nl = view.getUint16(i + 1);
+    if (i + 5 + nl > buf.length) { out.push(...buf.subarray(i)); break; }
+    const n = buf.subarray(i + 3, i + 3 + nl);
+    const vl = view.getUint16(i + 3 + nl);
+    const v = buf.subarray(i + 5 + nl, i + 5 + nl + vl);
+    if (nl) name = dec.decode(n);
+
+    let value: Uint8Array = v;
+    if (tag === TAG.uri && !URI_SCHEME.test(dec.decode(v))) {
+      fixed.push(`${name}="${dec.decode(v)}"`);
+      value = rep;
+    }
+    out.push(tag, nl >> 8, nl & 0xff, ...n, value.length >> 8, value.length & 0xff, ...value);
+    i += 5 + nl + vl;
+  }
+  return { buf: new Uint8Array(out), fixed };
+}
+
+/**
+ * Локальный IPP-прокси к аппарату, который чинит ответ (fixInvalidUris).
+ *
+ * Нужен только на время `lpadmin -m everywhere`: PPD строится по ответу через
+ * прокси, после чего очередь переводится на настоящий адрес аппарата. Бэкенд
+ * ipp при печати ответ так строго не проверяет.
+ */
+export function startFixingProxy(host: string, port = 631): {
+  port: number; fixed: Set<string>; stop: () => void;
+} {
+  const target = `http://${host}:${port}`;
+  const fixed = new Set<string>();
+  const server = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    async fetch(req) {
+      const resp = await fetch(target + new URL(req.url).pathname, {
+        method: req.method,
+        headers: { 'Content-Type': 'application/ipp' },
+        body: req.method === 'POST' ? await req.arrayBuffer() : undefined,
+      });
+      const r = fixInvalidUris(new Uint8Array(await resp.arrayBuffer()), `${target}/`);
+      r.fixed.forEach(f => fixed.add(f));
+      return new Response(r.buf, { status: resp.status, headers: { 'Content-Type': 'application/ipp' } });
+    },
+  });
+  return { port: server.port ?? 0, fixed, stop: () => server.stop(true) };
+}
+
 // ─── сводка для диагностики ───────────────────────────────────────────────────
 
 export interface PrinterInfo {
